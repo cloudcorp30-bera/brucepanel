@@ -25,6 +25,8 @@ export const api = {
   updateProfile: (email, bio) => req("PUT", "/account/profile", { email, bio }),
   changePassword: (currentPassword, newPassword) => req("PUT", "/account/password", { currentPassword, newPassword }),
   userActivity: () => req("GET", "/account/activity"),
+  getTelegram: () => req("GET", "/account/telegram"),
+  saveTelegram: (chatId, enabled) => req("PUT", "/account/telegram", { chatId, enabled }),
 
   // Notifications
   notifications: () => req("GET", "/notifications"),
@@ -49,6 +51,17 @@ export const api = {
   updateProjectSettings: (id, data) => req("PUT", `/projects/${id}/settings`, data),
   deployProject: (id, data) => req("POST", `/projects/${id}/deploy`, data),
   backupProject: (id) => `${BASE}/projects/${id}/backup`,
+  logsDownloadUrl: (id) => `${BASE}/projects/${id}/logs/download`,
+  cloneProject: (id, name) => req("POST", `/projects/${id}/clone`, { name }),
+
+  // Webhook
+  getWebhook: (id) => req("GET", `/projects/${id}/webhook`),
+  regenWebhook: (id) => req("POST", `/projects/${id}/webhook/regenerate`),
+
+  // npm package manager
+  npmPackages: (id) => req("GET", `/projects/${id}/npm/packages`),
+  npmInstall: (id, packages, dev = false) => req("POST", `/projects/${id}/npm/install`, { packages, dev }),
+  npmUninstall: (id, packages) => req("DELETE", `/projects/${id}/npm/uninstall`, { packages }),
 
   // File manager
   uploadFile: (projectId, file) => {
@@ -74,6 +87,13 @@ export const api = {
   // Referral
   referralInfo: () => req("GET", "/referral/info"),
 
+  // Store
+  getStore: () => req("GET", "/store"),
+  buyItem: (itemId) => req("POST", "/store/buy", { itemId }),
+
+  // Public status (no auth needed)
+  publicStatus: async () => { const r = await fetch(BASE + "/status"); return r.json(); },
+
   // Admin
   adminStats: () => req("GET", "/admin/stats"),
   adminSystem: () => req("GET", "/admin/system"),
@@ -81,7 +101,6 @@ export const api = {
   adminUpdateCoins: (id, amount, reason) => req("POST", `/admin/users/${id}/coins`, { amount, reason }),
   adminBan: (id, banned) => req("POST", `/admin/users/${id}/ban`, { banned }),
   adminSetRole: (id, role) => req("POST", `/admin/users/${id}/role`, { role }),
-  adminSetEmail: (id, email) => req("POST", `/admin/users/${id}/email`, { email }),
   adminDeleteUser: (id) => req("DELETE", `/admin/users/${id}`),
   adminMessageUser: (id, title, message, type) => req("POST", `/admin/users/${id}/message`, { title, message, type }),
   adminImpersonate: (id) => req("POST", `/admin/users/${id}/impersonate`),
