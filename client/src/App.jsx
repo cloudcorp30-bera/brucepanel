@@ -9,6 +9,7 @@ import Admin from "./pages/Admin";
 import Account from "./pages/Account";
 import Store from "./pages/Store";
 import Status from "./pages/Status";
+import Support from "./pages/Support";
 
 function PrivateRoute({ children }) {
   return localStorage.getItem("bp_token") ? children : <Navigate to="/login" replace />;
@@ -28,6 +29,7 @@ export default function App() {
         <Route path="/admin" element={<PrivateRoute><Admin /></PrivateRoute>} />
         <Route path="/account" element={<PrivateRoute><Account /></PrivateRoute>} />
         <Route path="/store" element={<PrivateRoute><Store /></PrivateRoute>} />
+        <Route path="/support" element={<PrivateRoute><Support /></PrivateRoute>} />
         <Route path="*" element={<Navigate to="/" />} />
       </Routes>
     </BrowserRouter>
