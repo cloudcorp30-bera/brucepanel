@@ -284,6 +284,8 @@ async function handleAutoRestart(projectId, code) {
       return;
     }
     addLog(projectId, "[BrucePanel] Process crashed (code " + code + "), auto-restarting in 3s...");
+    const pname = await pool.query("SELECT name FROM bp_projects WHERE id=$1",[projectId]).then(r=>r.rows[0]?.name||projectId).catch(()=>projectId);
+    notifyUserOnCrash(projectId, pname, code).catch(() => {});
     await pool.query("UPDATE bp_projects SET restart_count=COALESCE(restart_count,0)+1, last_restart=NOW(), status='installing' WHERE id=$1", [projectId]);
     setTimeout(async () => {
       try {
@@ -296,6 +298,35 @@ async function handleAutoRestart(projectId, code) {
         addLog(projectId, "[BrucePanel] Auto-restart failed: " + e.message);
       }
     }, 3000);
+  } catch {}
+}
+
+// ─── Telegram notifications ────────────────────────────────────────────────
+const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+async function sendTelegram(chatId, text) {
+  if (!TELEGRAM_TOKEN || !chatId) return;
+  try {
+    const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text, parse_mode: "Markdown" }),
+    });
+    if (!res.ok) console.error("Telegram send failed:", await res.text());
+  } catch (e) { console.error("Telegram error:", e.message); }
+}
+async function notifyUserOnCrash(projectId, projectName, code) {
+  try {
+    const r = await pool.query(
+      "SELECT u.telegram_chat_id, u.telegram_enabled FROM bp_users u JOIN bp_projects p ON p.user_id=u.id WHERE p.id=$1",
+      [projectId]
+    );
+    const u = r.rows[0];
+    if (u?.telegram_enabled && u?.telegram_chat_id) {
+      sendTelegram(u.telegram_chat_id,
+        `⚠️ *BrucePanel Alert*\n\nProject *${projectName}* crashed (exit code ${code}).\nAuto-restart is ${(await pool.query("SELECT auto_restart FROM bp_projects WHERE id=$1",[projectId])).rows[0]?.auto_restart ? "enabled — restarting..." : "disabled."}`
+      ).catch(() => {});
+    }
   } catch {}
 }
 // ─── Auth middleware ──────────────────────────────────────────────────────
@@ -1324,6 +1355,288 @@ app.post("/api/brucepanel/admin/users/:id/message", auth, adminOnly, async (req,
     );
     res.json({ message: "Message sent to user" });
   } catch { res.status(500).json({ error: "Failed" }); }
+});
+
+
+// ─── Public Status Page ───────────────────────────────────────────────────
+
+app.get("/api/brucepanel/status", async (_req, res) => {
+  try {
+    const [u, p, t] = await Promise.all([
+      pool.query("SELECT COUNT(*) FROM bp_users"),
+      pool.query("SELECT COUNT(*), COUNT(CASE WHEN status='running' THEN 1 END) as running FROM bp_projects"),
+      pool.query("SELECT COUNT(*), COALESCE(SUM(amount),0) as revenue FROM bp_transactions WHERE status='completed'"),
+    ]);
+    res.json({
+      status: "operational",
+      users: parseInt(u.rows[0].count),
+      projects: parseInt(p.rows[0].count),
+      running: parseInt(p.rows[0].running),
+      transactions: parseInt(t.rows[0].count),
+      revenue: parseInt(t.rows[0].revenue),
+      uptime: process.uptime(),
+    });
+  } catch { res.json({ status: "degraded" }); }
+});
+
+// ─── Webhook auto-deploy ───────────────────────────────────────────────────
+
+app.get("/api/brucepanel/projects/:id/webhook", auth, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT id, webhook_secret FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId]);
+    if (!r.rows[0]) return res.status(404).json({ error: "Not found" });
+    let secret = r.rows[0].webhook_secret;
+    if (!secret) {
+      secret = uuidv4().replace(/-/g, "");
+      await pool.query("UPDATE bp_projects SET webhook_secret=$1 WHERE id=$2", [secret, req.params.id]);
+    }
+    const baseUrl = process.env.RENDER_EXTERNAL_URL || process.env.BASE_URL || `http://localhost:${PORT}`;
+    res.json({ webhookUrl: `${baseUrl}/api/brucepanel/webhook/${secret}`, secret });
+  } catch { res.status(500).json({ error: "Failed" }); }
+});
+
+app.post("/api/brucepanel/projects/:id/webhook/regenerate", auth, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT id FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId]);
+    if (!r.rows[0]) return res.status(404).json({ error: "Not found" });
+    const secret = uuidv4().replace(/-/g, "");
+    await pool.query("UPDATE bp_projects SET webhook_secret=$1 WHERE id=$2", [secret, req.params.id]);
+    const baseUrl = process.env.RENDER_EXTERNAL_URL || process.env.BASE_URL || `http://localhost:${PORT}`;
+    res.json({ webhookUrl: `${baseUrl}/api/brucepanel/webhook/${secret}`, secret });
+  } catch { res.status(500).json({ error: "Failed" }); }
+});
+
+// Public webhook receiver — GitHub/any service calls this on push
+app.post("/api/brucepanel/webhook/:secret", async (req, res) => {
+  try {
+    const r = await pool.query("SELECT * FROM bp_projects WHERE webhook_secret=$1", [req.params.secret]);
+    const p = r.rows[0];
+    if (!p) return res.status(404).json({ error: "Invalid webhook" });
+    res.json({ message: "Webhook received — deploying..." });
+    // Trigger deploy in background
+    setImmediate(async () => {
+      try {
+        if (!p.github_url) return;
+        addLog(p.id, "[BrucePanel] Webhook triggered — redeploying...");
+        await pool.query("UPDATE bp_projects SET status='installing' WHERE id=$1", [p.id]);
+        await stopProcess(p.id);
+        const dir = path.join(PROJECTS_DIR, p.id);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        const gitDir = path.join(dir, ".git");
+        if (fs.existsSync(gitDir)) {
+          // Pull latest changes
+          await new Promise(res => {
+            const git = spawn("git", ["pull"], { cwd: dir });
+            git.stdout.on("data", d => addLog(p.id, d.toString().trim()));
+            git.stderr.on("data", d => addLog(p.id, d.toString().trim()));
+            git.on("exit", res);
+          });
+        } else {
+          // Fresh clone
+          await new Promise((resolve, reject) => {
+            const git = spawn("git", ["clone", p.github_url, "."], { cwd: dir });
+            git.stdout.on("data", d => addLog(p.id, d.toString().trim()));
+            git.stderr.on("data", d => addLog(p.id, d.toString().trim()));
+            git.on("exit", code => code === 0 ? resolve() : reject(new Error("Clone failed")));
+          });
+        }
+        if (fs.existsSync(path.join(dir, "package.json"))) {
+          await new Promise(resolve => {
+            const npm = spawn("npm", ["install"], { cwd: dir });
+            npm.stdout.on("data", d => addLog(p.id, d.toString().trim()));
+            npm.stderr.on("data", d => addLog(p.id, d.toString().trim()));
+            npm.on("exit", resolve);
+          });
+        }
+        await startProcess(p.id, dir, p.start_command, JSON.parse(p.env || "{}"));
+        await pool.query("UPDATE bp_projects SET status='running' WHERE id=$1", [p.id]);
+        addLog(p.id, "[BrucePanel] Webhook deploy complete!");
+      } catch (e) {
+        await pool.query("UPDATE bp_projects SET status='error' WHERE id=$1", [p.id]);
+        addLog(p.id, "[BrucePanel] Webhook deploy failed: " + e.message);
+      }
+    });
+  } catch (e) { res.status(500).json({ error: "Failed" }); }
+});
+
+// ─── npm Package Manager ───────────────────────────────────────────────────
+
+app.get("/api/brucepanel/projects/:id/npm/packages", auth, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT id FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId]);
+    if (!r.rows[0]) return res.status(404).json({ error: "Not found" });
+    const pkgPath = path.join(PROJECTS_DIR, req.params.id, "package.json");
+    if (!fs.existsSync(pkgPath)) return res.json({ packages: [], devPackages: [] });
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+    const deps = Object.entries(pkg.dependencies || {}).map(([n, v]) => ({ name: n, version: v, dev: false }));
+    const devDeps = Object.entries(pkg.devDependencies || {}).map(([n, v]) => ({ name: n, version: v, dev: true }));
+    res.json({ packages: [...deps, ...devDeps], name: pkg.name, scripts: pkg.scripts || {} });
+  } catch (e) { res.status(500).json({ error: "Failed to read package.json" }); }
+});
+
+app.post("/api/brucepanel/projects/:id/npm/install", auth, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT id FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId]);
+    if (!r.rows[0]) return res.status(404).json({ error: "Not found" });
+    const { packages, dev = false } = req.body;
+    if (!packages || !Array.isArray(packages) || packages.length === 0)
+      return res.status(400).json({ error: "Packages array required" });
+    // Validate package names
+    const validName = /^[@a-zA-Z0-9\-_/.]+$/;
+    if (!packages.every(p => validName.test(p))) return res.status(400).json({ error: "Invalid package name" });
+    const dir = path.join(PROJECTS_DIR, req.params.id);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    res.json({ message: `Installing ${packages.join(", ")}...` });
+    setImmediate(() => {
+      const args = ["install", ...packages, ...(dev ? ["--save-dev"] : ["--save"])];
+      addLog(req.params.id, `[npm] $ npm ${args.join(" ")}`);
+      const proc = spawn("npm", args, { cwd: dir });
+      proc.stdout.on("data", d => addLog(req.params.id, d.toString().trim()));
+      proc.stderr.on("data", d => addLog(req.params.id, d.toString().trim()));
+      proc.on("exit", code => addLog(req.params.id, `[npm] install finished (exit ${code})`));
+    });
+  } catch (e) { res.status(500).json({ error: "Failed" }); }
+});
+
+app.delete("/api/brucepanel/projects/:id/npm/uninstall", auth, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT id FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId]);
+    if (!r.rows[0]) return res.status(404).json({ error: "Not found" });
+    const { packages } = req.body;
+    if (!packages?.length) return res.status(400).json({ error: "Packages required" });
+    const dir = path.join(PROJECTS_DIR, req.params.id);
+    res.json({ message: `Uninstalling ${packages.join(", ")}...` });
+    setImmediate(() => {
+      addLog(req.params.id, `[npm] $ npm uninstall ${packages.join(" ")}`);
+      const proc = spawn("npm", ["uninstall", ...packages], { cwd: dir });
+      proc.stdout.on("data", d => addLog(req.params.id, d.toString().trim()));
+      proc.stderr.on("data", d => addLog(req.params.id, d.toString().trim()));
+      proc.on("exit", code => addLog(req.params.id, `[npm] uninstall finished (exit ${code})`));
+    });
+  } catch (e) { res.status(500).json({ error: "Failed" }); }
+});
+
+// ─── Project clone ─────────────────────────────────────────────────────────
+
+app.post("/api/brucepanel/projects/:id/clone", auth, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT * FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId]);
+    const src = r.rows[0];
+    if (!src) return res.status(404).json({ error: "Not found" });
+    const userCoins = await pool.query("SELECT coins, free_apps_used FROM bp_users WHERE id=$1", [req.userId]);
+    const { coins, free_apps_used } = userCoins.rows[0];
+    const isFree = free_apps_used < 2;
+    if (!isFree && coins < 50) return res.status(402).json({ error: "INSUFFICIENT_COINS" });
+    const newId = uuidv4();
+    const newName = (req.body.name || src.name + " (copy)").slice(0, 100);
+    await pool.query(
+      "INSERT INTO bp_projects (id,user_id,name,description,start_command,github_url,env,is_free_slot,status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'idle')",
+      [newId, req.userId, newName, src.description, src.start_command, src.github_url, src.env, isFree]
+    );
+    if (isFree) {
+      await pool.query("UPDATE bp_users SET free_apps_used=free_apps_used+1 WHERE id=$1", [req.userId]);
+    } else {
+      await pool.query("UPDATE bp_users SET coins=coins-50 WHERE id=$1", [req.userId]);
+    }
+    // Copy project files in background
+    const srcDir = path.join(PROJECTS_DIR, src.id);
+    const dstDir = path.join(PROJECTS_DIR, newId);
+    setImmediate(() => {
+      try {
+        if (fs.existsSync(srcDir)) {
+          fs.mkdirSync(dstDir, { recursive: true });
+          const IGNORE = new Set(["node_modules", ".git", "brucepanel.log"]);
+          function copyDir(s, d) {
+            fs.mkdirSync(d, { recursive: true });
+            for (const item of fs.readdirSync(s, { withFileTypes: true })) {
+              if (IGNORE.has(item.name)) continue;
+              const sp = path.join(s, item.name), dp = path.join(d, item.name);
+              item.isDirectory() ? copyDir(sp, dp) : fs.copyFileSync(sp, dp);
+            }
+          }
+          copyDir(srcDir, dstDir);
+        }
+      } catch (e) { console.error("Clone copy error:", e.message); }
+    });
+    res.json({ message: "Project cloned!", projectId: newId, name: newName });
+  } catch (e) { res.status(500).json({ error: e.message || "Failed" }); }
+});
+
+// ─── Log download ──────────────────────────────────────────────────────────
+
+app.get("/api/brucepanel/projects/:id/logs/download", auth, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT id, name FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId]);
+    if (!r.rows[0]) return res.status(404).json({ error: "Not found" });
+    const entry = processes.get(req.params.id);
+    const live  = entry?.logs || [];
+    const file  = readLogs(req.params.id, 5000);
+    const all   = [...new Set([...file, ...live])].join("\n");
+    const safeName = r.rows[0].name.replace(/[^a-zA-Z0-9\-_]/g, "_");
+    res.setHeader("Content-Type", "text/plain");
+    res.setHeader("Content-Disposition", `attachment; filename="${safeName}-logs.txt"`);
+    res.send(all || "(no logs)");
+  } catch { res.status(500).json({ error: "Failed" }); }
+});
+
+// ─── Telegram notification settings ───────────────────────────────────────
+
+app.put("/api/brucepanel/account/telegram", auth, async (req, res) => {
+  const { chatId, enabled = true } = req.body;
+  try {
+    await pool.query(
+      "UPDATE bp_users SET telegram_chat_id=$1, telegram_enabled=$2 WHERE id=$3",
+      [chatId || null, enabled, req.userId]
+    );
+    if (chatId && enabled) {
+      // Send a test message
+      sendTelegram(chatId, "✅ *BrucePanel* notifications connected!\n\nYou will now receive alerts when your projects crash.").catch(() => {});
+    }
+    res.json({ message: "Telegram settings updated" });
+  } catch { res.status(500).json({ error: "Failed" }); }
+});
+
+app.get("/api/brucepanel/account/telegram", auth, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT telegram_chat_id, telegram_enabled FROM bp_users WHERE id=$1", [req.userId]);
+    const u = r.rows[0];
+    res.json({ chatId: u?.telegram_chat_id || "", enabled: u?.telegram_enabled ?? false, botName: process.env.TELEGRAM_BOT_USERNAME || "" });
+  } catch { res.json({ chatId: "", enabled: false }); }
+});
+
+// ─── BB Coins Store ────────────────────────────────────────────────────────
+
+const STORE_ITEMS = [
+  { id: "extra_slot",     label: "Extra Project Slot",     price: 200, desc: "Add 1 more project slot (permanent)",   icon: "📁" },
+  { id: "priority_badge", label: "Priority Support Badge", price: 500, desc: "Get priority support from the team",    icon: "⭐" },
+  { id: "custom_domain",  label: "Custom Domain Slot",     price: 300, desc: "Map a custom domain to your project",   icon: "🌐" },
+  { id: "coins_100",      label: "100 BB Coins",           price: 80,  desc: "Buy 100 BB Coins (spending 80 = +20 bonus)", icon: "🪙" },
+];
+
+app.get("/api/brucepanel/store", auth, (_req, res) => res.json({ items: STORE_ITEMS }));
+
+app.post("/api/brucepanel/store/buy", auth, async (req, res) => {
+  const { itemId } = req.body;
+  const item = STORE_ITEMS.find(i => i.id === itemId);
+  if (!item) return res.status(404).json({ error: "Item not found" });
+  try {
+    const r = await pool.query("SELECT coins FROM bp_users WHERE id=$1", [req.userId]);
+    const { coins } = r.rows[0];
+    if (coins < item.price) return res.status(402).json({ error: `Not enough BB Coins. Need ${item.price}, have ${coins}.` });
+    await pool.query("UPDATE bp_users SET coins=coins-$1 WHERE id=$2", [item.price, req.userId]);
+    // Apply effect
+    if (itemId === "extra_slot") {
+      await pool.query("UPDATE bp_users SET free_apps_used=GREATEST(0, free_apps_used-1) WHERE id=$1", [req.userId]);
+    } else if (itemId === "coins_100") {
+      await pool.query("UPDATE bp_users SET coins=coins+100 WHERE id=$1", [req.userId]);
+    }
+    await pool.query(
+      "INSERT INTO bp_notifications (id,user_id,title,message,type) VALUES ($1,$2,$3,$4,'success')",
+      [uuidv4(), req.userId, `Purchase: ${item.label}`, `You purchased "${item.label}" for ${item.price} BB Coins. Enjoy!`]
+    );
+    auditLog(req.userId, "", "store_purchase", `item:${itemId} price:${item.price}`, "");
+    res.json({ message: `"${item.label}" purchased!`, coinsSpent: item.price });
+  } catch (e) { res.status(500).json({ error: "Failed" }); }
 });
 
 
