@@ -1640,6 +1640,245 @@ app.post("/api/brucepanel/store/buy", auth, async (req, res) => {
 });
 
 
+// ─── Analytics (30-day daily breakdown) ───────────────────────────────────
+
+app.get("/api/brucepanel/admin/analytics", auth, adminOnly, async (_req, res) => {
+  try {
+    const [revenue, signups, projects, coins] = await Promise.all([
+      pool.query(`
+        SELECT DATE(created_at) AS day, SUM(amount) AS total
+        FROM bp_transactions WHERE status='completed'
+          AND created_at > NOW() - INTERVAL '30 days'
+        GROUP BY day ORDER BY day`),
+      pool.query(`
+        SELECT DATE(created_at) AS day, COUNT(*) AS total
+        FROM bp_users
+        WHERE created_at > NOW() - INTERVAL '30 days'
+        GROUP BY day ORDER BY day`),
+      pool.query(`
+        SELECT DATE(created_at) AS day, COUNT(*) AS total
+        FROM bp_projects
+        WHERE created_at > NOW() - INTERVAL '30 days'
+        GROUP BY day ORDER BY day`),
+      pool.query(`
+        SELECT DATE(created_at) AS day, SUM(amount) AS total
+        FROM bp_transactions WHERE status='completed' AND type='subscription'
+          AND created_at > NOW() - INTERVAL '30 days'
+        GROUP BY day ORDER BY day`),
+    ]);
+    // Totals
+    const [totRevenue, totUsers, totProjects, totTransactions, totCoins] = await Promise.all([
+      pool.query("SELECT COALESCE(SUM(amount),0) AS v FROM bp_transactions WHERE status='completed'"),
+      pool.query("SELECT COUNT(*) AS v FROM bp_users"),
+      pool.query("SELECT COUNT(*) AS v FROM bp_projects"),
+      pool.query("SELECT COUNT(*) AS v FROM bp_transactions WHERE status='completed'"),
+      pool.query("SELECT COALESCE(SUM(coins),0) AS v FROM bp_users"),
+    ]);
+    res.json({
+      revenue:  revenue.rows,
+      signups:  signups.rows,
+      projects: projects.rows,
+      totals: {
+        revenue:      parseInt(totRevenue.rows[0].v),
+        users:        parseInt(totUsers.rows[0].v),
+        projects:     parseInt(totProjects.rows[0].v),
+        transactions: parseInt(totTransactions.rows[0].v),
+        coins:        parseInt(totCoins.rows[0].v),
+      }
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Live activity feed (last 30 audit entries, real-time poll) ────────────
+
+app.get("/api/brucepanel/admin/live-feed", auth, adminOnly, async (_req, res) => {
+  try {
+    const [activity, running, recent] = await Promise.all([
+      pool.query(`
+        SELECT al.*, u.username FROM bp_audit_log al
+        LEFT JOIN bp_users u ON u.id=al.user_id
+        ORDER BY al.created_at DESC LIMIT 30`),
+      pool.query("SELECT COUNT(*) FROM bp_projects WHERE status='running'"),
+      pool.query(`SELECT username, created_at FROM bp_users ORDER BY created_at DESC LIMIT 5`),
+    ]);
+    res.json({
+      feed:          activity.rows,
+      runningNow:    parseInt(running.rows[0].count),
+      recentSignups: recent.rows,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── CSV Exports ───────────────────────────────────────────────────────────
+
+app.get("/api/brucepanel/admin/export/users", auth, adminOnly, async (_req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT u.id, u.username, u.email, u.role, u.coins, u.is_banned, u.referral_code,
+             u.created_at, u.last_login,
+             (SELECT COUNT(*) FROM bp_projects WHERE user_id=u.id) AS projects,
+             (SELECT COUNT(*) FROM bp_referrals WHERE referrer_id=u.id) AS referrals,
+             (SELECT COALESCE(SUM(amount),0) FROM bp_transactions WHERE user_id=u.id AND status='completed') AS spent
+      FROM bp_users u ORDER BY u.created_at DESC`);
+    const cols = ["id","username","email","role","coins","is_banned","referral_code","created_at","last_login","projects","referrals","spent"];
+    const rows = r.rows.map(row => cols.map(c => JSON.stringify(row[c] ?? "")).join(","));
+    const csv  = [cols.join(","), ...rows].join("\n");
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", `attachment; filename="bp_users_${Date.now()}.csv"`);
+    res.send(csv);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get("/api/brucepanel/admin/export/transactions", auth, adminOnly, async (_req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT t.id, u.username, t.plan_id, t.amount, t.status, t.phone, t.checkout_request_id, t.created_at
+      FROM bp_transactions t LEFT JOIN bp_users u ON u.id=t.user_id
+      ORDER BY t.created_at DESC`);
+    const cols = ["id","username","plan_id","amount","status","phone","checkout_request_id","created_at"];
+    const rows = r.rows.map(row => cols.map(c => JSON.stringify(row[c] ?? "")).join(","));
+    const csv  = [cols.join(","), ...rows].join("\n");
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", `attachment; filename="bp_transactions_${Date.now()}.csv"`);
+    res.send(csv);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get("/api/brucepanel/admin/export/projects", auth, adminOnly, async (_req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT p.id, u.username, p.name, p.status, p.start_command, p.github_url,
+             p.auto_restart, p.restart_count, p.created_at
+      FROM bp_projects p LEFT JOIN bp_users u ON u.id=p.user_id
+      ORDER BY p.created_at DESC`);
+    const cols = ["id","username","name","status","start_command","github_url","auto_restart","restart_count","created_at"];
+    const rows = r.rows.map(row => cols.map(c => JSON.stringify(row[c] ?? "")).join(","));
+    const csv  = [cols.join(","), ...rows].join("\n");
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", `attachment; filename="bp_projects_${Date.now()}.csv"`);
+    res.send(csv);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── User search / segment ─────────────────────────────────────────────────
+
+app.get("/api/brucepanel/admin/users/search", auth, adminOnly, async (req, res) => {
+  const { q = "", role = "", minCoins = "", maxCoins = "", banned = "" } = req.query;
+  try {
+    let where = ["1=1"];
+    const params = [];
+    if (q) { params.push(`%${q}%`); where.push(`(u.username ILIKE ${params.length} OR u.email ILIKE ${params.length})`); }
+    if (role) { params.push(role); where.push(`u.role=${params.length}`); }
+    if (minCoins) { params.push(parseInt(minCoins)); where.push(`u.coins >= ${params.length}`); }
+    if (maxCoins) { params.push(parseInt(maxCoins)); where.push(`u.coins <= ${params.length}`); }
+    if (banned === "true")  where.push("u.is_banned = true");
+    if (banned === "false") where.push("u.is_banned = false");
+    const r = await pool.query(`
+      SELECT u.id, u.username, u.email, u.role, u.coins, u.is_banned, u.created_at, u.last_login,
+             (SELECT COUNT(*) FROM bp_projects WHERE user_id=u.id) AS project_count
+      FROM bp_users u WHERE ${where.join(" AND ")}
+      ORDER BY u.coins DESC LIMIT 100`, params);
+    res.json({ users: r.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Bulk actions ──────────────────────────────────────────────────────────
+
+app.post("/api/brucepanel/admin/users/bulk-action", auth, adminOnly, async (req, res) => {
+  const { userIds, action, value, reason } = req.body;
+  if (!Array.isArray(userIds) || !userIds.length) return res.status(400).json({ error: "No users selected" });
+  try {
+    let affected = 0;
+    for (const uid of userIds) {
+      if (action === "add_coins") {
+        await pool.query("UPDATE bp_users SET coins=coins+$1 WHERE id=$2", [parseInt(value), uid]);
+      } else if (action === "ban") {
+        await pool.query("UPDATE bp_users SET is_banned=true WHERE id=$1", [uid]);
+      } else if (action === "unban") {
+        await pool.query("UPDATE bp_users SET is_banned=false WHERE id=$1", [uid]);
+      } else if (action === "set_role") {
+        if (!["user","moderator","admin"].includes(value)) continue;
+        await pool.query("UPDATE bp_users SET role=$1 WHERE id=$2", [value, uid]);
+      } else if (action === "notify") {
+        await pool.query(
+          "INSERT INTO bp_notifications (id,user_id,title,message,type) VALUES ($1,$2,$3,$4,'info')",
+          [uuidv4(), uid, reason || "Admin Notification", value]
+        );
+      }
+      affected++;
+    }
+    auditLog(req.userId, req.ip, `bulk_${action}`, `${affected} users, value:${value||""} reason:${reason||""}`, req.ip);
+    res.json({ message: `Bulk ${action} applied to ${affected} users` });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Emergency controls ────────────────────────────────────────────────────
+
+app.post("/api/brucepanel/admin/emergency/stop-all", auth, adminOnly, async (req, res) => {
+  try {
+    const running = await pool.query("SELECT id FROM bp_projects WHERE status='running'");
+    let count = 0;
+    for (const p of running.rows) {
+      try { await stopProcess(p.id); await pool.query("UPDATE bp_projects SET status='stopped' WHERE id=$1", [p.id]); count++; } catch {}
+    }
+    auditLog(req.userId, req.ip, "emergency_stop_all", `stopped ${count} projects`, req.ip);
+    res.json({ message: `Emergency stop: ${count} projects stopped` });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/api/brucepanel/admin/emergency/broadcast", auth, adminOnly, async (req, res) => {
+  const { title, message, type = "warning" } = req.body;
+  if (!title || !message) return res.status(400).json({ error: "Title and message required" });
+  try {
+    const users = await pool.query("SELECT id FROM bp_users WHERE is_banned=false");
+    for (const u of users.rows) {
+      await pool.query(
+        "INSERT INTO bp_notifications (id,user_id,title,message,type) VALUES ($1,$2,$3,$4,$5)",
+        [uuidv4(), u.id, title, message, type]
+      );
+    }
+    auditLog(req.userId, req.ip, "emergency_broadcast", `"${title}" → ${users.rows.length} users`, req.ip);
+    res.json({ message: `Broadcast sent to ${users.rows.length} users` });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/api/brucepanel/admin/emergency/restart-all", auth, adminOnly, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT * FROM bp_projects WHERE status='running'");
+    let count = 0;
+    for (const p of r.rows) {
+      try {
+        await stopProcess(p.id);
+        const dir = path.join(PROJECTS_DIR, p.id);
+        if (fs.existsSync(dir)) {
+          await startProcess(p.id, dir, p.start_command, JSON.parse(p.env || "{}"));
+          count++;
+        }
+      } catch {}
+    }
+    auditLog(req.userId, req.ip, "emergency_restart_all", `restarted ${count} projects`, req.ip);
+    res.json({ message: `Restarted ${count} running projects` });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Admin notes (internal sticky notes) ──────────────────────────────────
+
+app.get("/api/brucepanel/admin/notes", auth, adminOnly, async (_req, res) => {
+  try {
+    const r = await pool.query("SELECT value FROM bp_platform_settings WHERE key='admin_notes'");
+    res.json({ notes: r.rows[0]?.value || "" });
+  } catch { res.json({ notes: "" }); }
+});
+
+app.put("/api/brucepanel/admin/notes", auth, adminOnly, async (req, res) => {
+  const { notes } = req.body;
+  try {
+    await pool.query(`INSERT INTO bp_platform_settings (key,value) VALUES ('admin_notes',$1)
+      ON CONFLICT (key) DO UPDATE SET value=$1`, [notes]);
+    res.json({ message: "Saved" });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ─── Static client ────────────────────────────────────────────────────────
 const clientDist = path.join(__dirname, "client", "dist");
 if (fs.existsSync(clientDist)) {
