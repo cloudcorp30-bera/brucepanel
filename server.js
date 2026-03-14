@@ -765,7 +765,7 @@ app.post("/api/brucepanel/admin/notifications/purge", auth, adminOnly, async (re
   try {
     const { olderThanDays = 30 } = req.body;
     const r = await pool.query(
-      "DELETE FROM bp_notifications WHERE read=true AND created_at < NOW() - INTERVAL '$1 days'",
+      "DELETE FROM bp_notifications WHERE read=true AND created_at < NOW() - make_interval(days => $1::int)",
       [olderThanDays]
     );
     res.json({ message: `Purged old notifications`, deleted: r.rowCount });
