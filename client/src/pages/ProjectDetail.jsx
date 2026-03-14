@@ -487,15 +487,16 @@ export default function ProjectDetail() {
                 </div>
               </div>
 
-            <div className="bg-[#111118] border border-[#2d2d3e] rounded-xl p-6 space-y-3">
-              <h3 className="text-white font-medium">Project Info</h3>
-              <div className="grid grid-cols-2 gap-3 text-sm">
-                <div><p className="text-slate-500 text-xs">ID</p><p className="text-slate-300 font-mono text-xs mt-0.5">{project.id}</p></div>
-                <div><p className="text-slate-500 text-xs">Status</p><p className={`mt-0.5 text-sm ${STATUS_TEXT[project.status]}`}>{project.status}</p></div>
-                <div><p className="text-slate-500 text-xs">Start Command</p><p className="text-slate-300 font-mono text-xs mt-0.5">{project.startCommand}</p></div>
-                <div><p className="text-slate-500 text-xs">Created</p><p className="text-slate-300 text-xs mt-0.5">{new Date(project.createdAt||project.created_at).toLocaleDateString()}</p></div>
-                <div><p className="text-slate-500 text-xs">Restarts</p><p className="text-slate-300 text-xs mt-0.5">{project.restart_count || 0}</p></div>
-                <div><p className="text-slate-500 text-xs">Auto-Restart</p><p className={`text-xs mt-0.5 ${project.auto_restart ? "text-green-400" : "text-slate-500"}`}>{project.auto_restart ? "Enabled" : "Disabled"}</p></div>
+              <div className="bg-[#111118] border border-[#2d2d3e] rounded-xl p-6 space-y-3">
+                <h3 className="text-white font-medium">Project Info</h3>
+                <div className="grid grid-cols-2 gap-3 text-sm">
+                  <div><p className="text-slate-500 text-xs">ID</p><p className="text-slate-300 font-mono text-xs mt-0.5">{project.id}</p></div>
+                  <div><p className="text-slate-500 text-xs">Status</p><p className={`mt-0.5 text-sm ${STATUS_TEXT[project.status]}`}>{project.status}</p></div>
+                  <div><p className="text-slate-500 text-xs">Start Command</p><p className="text-slate-300 font-mono text-xs mt-0.5">{project.startCommand}</p></div>
+                  <div><p className="text-slate-500 text-xs">Created</p><p className="text-slate-300 text-xs mt-0.5">{new Date(project.createdAt||project.created_at).toLocaleDateString()}</p></div>
+                  <div><p className="text-slate-500 text-xs">Restarts</p><p className="text-slate-300 text-xs mt-0.5">{project.restart_count || 0}</p></div>
+                  <div><p className="text-slate-500 text-xs">Auto-Restart</p><p className={`text-xs mt-0.5 ${project.auto_restart ? "text-green-400" : "text-slate-500"}`}>{project.auto_restart ? "Enabled" : "Disabled"}</p></div>
+                </div>
               </div>
             </div>
           </div>
