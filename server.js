@@ -186,7 +186,47 @@ async function initDB() {
     `ALTER TABLE bp_users ADD COLUMN IF NOT EXISTS referral_code TEXT`,
     `ALTER TABLE bp_users ADD COLUMN IF NOT EXISTS referred_by TEXT`,
     `ALTER TABLE bp_users ADD COLUMN IF NOT EXISTS free_apps_used INTEGER NOT NULL DEFAULT 0`,
-    `ALTER TABLE bp_projects ADD COLUMN IF NOT EXISTS is_free_slot BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE bp_projects ADD COLUMN IF NOT EXISTS is_free_slot BOOLEAN NOT NULL DEFAULT false`
+
+    // New tables for advanced features
+    await pool.query(\`
+      CREATE TABLE IF NOT EXISTS bp_promo_codes (
+        id SERIAL PRIMARY KEY,
+        code TEXT UNIQUE NOT NULL,
+        coins INTEGER NOT NULL DEFAULT 0,
+        max_uses INTEGER NOT NULL DEFAULT -1,
+        used_count INTEGER NOT NULL DEFAULT 0,
+        expires_at TIMESTAMP,
+        created_by TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      )\`);
+
+    await pool.query(\`
+      CREATE TABLE IF NOT EXISTS bp_audit_log (
+        id SERIAL PRIMARY KEY,
+        user_id TEXT,
+        username TEXT,
+        action TEXT NOT NULL,
+        details TEXT DEFAULT '',
+        ip TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT NOW()
+      )\`);
+
+    await pool.query(\`
+      CREATE TABLE IF NOT EXISTS bp_platform_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL DEFAULT '',
+        updated_at TIMESTAMP DEFAULT NOW()
+      )\`);
+
+    for (const q of [
+      \`ALTER TABLE bp_projects ADD COLUMN IF NOT EXISTS auto_restart BOOLEAN DEFAULT FALSE\`,
+      \`ALTER TABLE bp_projects ADD COLUMN IF NOT EXISTS restart_count INTEGER DEFAULT 0\`,
+      \`ALTER TABLE bp_projects ADD COLUMN IF NOT EXISTS last_restart TIMESTAMP\`,
+      \`ALTER TABLE bp_users ADD COLUMN IF NOT EXISTS last_login TIMESTAMP\`,
+      \`ALTER TABLE bp_users ADD COLUMN IF NOT EXISTS bio TEXT DEFAULT ''\`,
+    ]) { try { await pool.query(q); } catch {} }
+,
   ];
   for (const sql of alters) {
     try { await pool.query(sql); } catch {}
@@ -218,6 +258,46 @@ async function notify(userId, title, message, type = "info") {
   } catch {}
 }
 
+
+// ─── Audit log helper ─────────────────────────────────────────────────────
+async function auditLog(userId, username, action, details, ip) {
+  try { await pool.query("INSERT INTO bp_audit_log (user_id,username,action,details,ip) VALUES ($1,$2,$3,$4,$5)", [userId||null, username||"", action, details||"", ip||""]); } catch {}
+}
+
+// ─── Templates ────────────────────────────────────────────────────────────
+const TEMPLATES = [
+  { id:"whatsapp-bot",  label:"WhatsApp Bot",   desc:"Multi-device WhatsApp bot",    startCommand:"node index.js"  },
+  { id:"discord-bot",   label:"Discord Bot",    desc:"Discord.js bot starter",        startCommand:"node index.js"  },
+  { id:"express-api",   label:"Express API",    desc:"REST API with Express.js",      startCommand:"node server.js" },
+  { id:"telegram-bot",  label:"Telegram Bot",   desc:"Telegraf Telegram bot",         startCommand:"node bot.js"    },
+  { id:"next-app",      label:"Next.js App",    desc:"Full-stack Next.js application",startCommand:"npm start"      },
+  { id:"blank",         label:"Blank Project",  desc:"Empty — upload your own code",  startCommand:"node index.js"  },
+];
+
+// ─── Auto-restart manager ─────────────────────────────────────────────────
+async function handleAutoRestart(projectId, code) {
+  try {
+    const r = await pool.query("SELECT auto_restart, start_command, env FROM bp_projects WHERE id=$1", [projectId]);
+    const p = r.rows[0];
+    if (!p || !p.auto_restart || code === 0) {
+      await pool.query("UPDATE bp_projects SET status='stopped' WHERE id=$1", [projectId]).catch(()=>{});
+      return;
+    }
+    addLog(projectId, "[BrucePanel] Process crashed (code " + code + "), auto-restarting in 3s...");
+    await pool.query("UPDATE bp_projects SET restart_count=COALESCE(restart_count,0)+1, last_restart=NOW(), status='installing' WHERE id=$1", [projectId]);
+    setTimeout(async () => {
+      try {
+        const dir = path.join(PROJECTS_DIR, projectId);
+        await startProcess(projectId, dir, p.start_command, JSON.parse(p.env || "{}"));
+        await pool.query("UPDATE bp_projects SET status='running' WHERE id=$1", [projectId]);
+        addLog(projectId, "[BrucePanel] Auto-restarted successfully.");
+      } catch (e) {
+        await pool.query("UPDATE bp_projects SET status='error' WHERE id=$1", [projectId]);
+        addLog(projectId, "[BrucePanel] Auto-restart failed: " + e.message);
+      }
+    }, 3000);
+  } catch {}
+}
 // ─── Auth middleware ──────────────────────────────────────────────────────
 function auth(req, res, next) {
   const token = req.headers.authorization?.replace("Bearer ", "");
@@ -963,6 +1043,289 @@ app.post("/api/brucepanel/admin/bulk/coins", auth, adminOnly, async (req, res) =
     res.json({ message: `Airdropped ${amount} coins to ${excludeAdmin ? "all regular users" : "everyone"}` });
   } catch (e) { res.status(500).json({ error: "Failed" }); }
 });
+
+// ─── Account routes ────────────────────────────────────────────────────────
+
+app.put("/api/brucepanel/account/password", auth, async (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+  if (!currentPassword || !newPassword || newPassword.length < 6)
+    return res.status(400).json({ error: "Invalid input — new password must be at least 6 chars" });
+  try {
+    const r = await pool.query("SELECT * FROM bp_users WHERE id=$1", [req.userId]);
+    const user = r.rows[0];
+    if (!user || !(await bcrypt.compare(currentPassword, user.password_hash)))
+      return res.status(401).json({ error: "Current password is incorrect" });
+    const hash = await bcrypt.hash(newPassword, 10);
+    await pool.query("UPDATE bp_users SET password_hash=$1 WHERE id=$2", [hash, req.userId]);
+    auditLog(req.userId, user.username, "password_change", "", req.ip);
+    res.json({ message: "Password updated successfully" });
+  } catch { res.status(500).json({ error: "Failed" }); }
+});
+
+app.put("/api/brucepanel/account/profile", auth, async (req, res) => {
+  const { email, bio } = req.body;
+  try {
+    await pool.query("UPDATE bp_users SET email=$1, bio=$2 WHERE id=$3", [email || "", bio || "", req.userId]);
+    res.json({ message: "Profile updated" });
+  } catch { res.status(500).json({ error: "Failed" }); }
+});
+
+app.get("/api/brucepanel/account/activity", auth, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT action, details, ip, created_at FROM bp_audit_log WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50", [req.userId]);
+    res.json({ activity: r.rows });
+  } catch { res.json({ activity: [] }); }
+});
+
+// ─── Templates ────────────────────────────────────────────────────────────
+
+app.get("/api/brucepanel/templates", (_req, res) => res.json({ templates: TEMPLATES }));
+
+// ─── Promo code redemption ─────────────────────────────────────────────────
+
+app.post("/api/brucepanel/promo/redeem", auth, async (req, res) => {
+  const { code } = req.body;
+  if (!code) return res.status(400).json({ error: "Code required" });
+  try {
+    const r = await pool.query("SELECT * FROM bp_promo_codes WHERE code=$1", [code.toUpperCase().trim()]);
+    const promo = r.rows[0];
+    if (!promo) return res.status(404).json({ error: "Invalid promo code" });
+    if (promo.expires_at && new Date(promo.expires_at) < new Date())
+      return res.status(400).json({ error: "This promo code has expired" });
+    if (promo.max_uses !== -1 && promo.used_count >= promo.max_uses)
+      return res.status(400).json({ error: "Promo code is fully used" });
+    const used = await pool.query(
+      "SELECT id FROM bp_audit_log WHERE user_id=$1 AND action='promo_redeem' AND details LIKE $2 LIMIT 1",
+      [req.userId, `%${promo.code}%`]
+    );
+    if (used.rows.length) return res.status(400).json({ error: "You already redeemed this code" });
+    await pool.query("UPDATE bp_promo_codes SET used_count=used_count+1 WHERE id=$1", [promo.id]);
+    await pool.query("UPDATE bp_users SET coins=coins+$1 WHERE id=$2", [promo.coins, req.userId]);
+    auditLog(req.userId, "", "promo_redeem", `code:${promo.code} coins:${promo.coins}`, req.ip);
+    res.json({ message: `Code redeemed! +${promo.coins} BB Coins added to your account.`, coins: promo.coins });
+  } catch { res.status(500).json({ error: "Failed" }); }
+});
+
+// ─── Project backup (ZIP download) ─────────────────────────────────────────
+
+app.get("/api/brucepanel/projects/:id/backup", auth, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT id, name FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId]);
+    if (!r.rows[0]) return res.status(404).json({ error: "Not found" });
+    const projectDir = path.join(PROJECTS_DIR, req.params.id);
+    if (!fs.existsSync(projectDir)) return res.status(404).json({ error: "No files in project yet" });
+    const zip = new AdmZip();
+    const IGNORE = new Set(["node_modules", ".git", "brucepanel.log", ".npm", ".cache"]);
+    function addDir(dir, base) {
+      try {
+        for (const item of fs.readdirSync(dir, { withFileTypes: true })) {
+          if (IGNORE.has(item.name)) continue;
+          const full = path.join(dir, item.name);
+          const zipBase = base || "";
+          if (item.isDirectory()) addDir(full, zipBase ? zipBase + "/" + item.name : item.name);
+          else zip.addLocalFile(full, zipBase);
+        }
+      } catch {}
+    }
+    addDir(projectDir, "");
+    const buf = zip.toBuffer();
+    const safeName = r.rows[0].name.replace(/[^a-zA-Z0-9\-_]/g, "_");
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="${safeName}-backup.zip"`);
+    res.send(buf);
+  } catch (e) { res.status(500).json({ error: "Failed to create backup" }); }
+});
+
+// ─── Project settings update ───────────────────────────────────────────────
+
+app.put("/api/brucepanel/projects/:id/settings", auth, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT id FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId]);
+    if (!r.rows[0]) return res.status(404).json({ error: "Not found" });
+    const { name, description, startCommand, githubUrl, autoRestart } = req.body;
+    const fields = [], vals = [];
+    let i = 1;
+    if (name !== undefined)        { fields.push(`name=${i++}`);          vals.push(name); }
+    if (description !== undefined) { fields.push(`description=${i++}`);   vals.push(description); }
+    if (startCommand !== undefined){ fields.push(`start_command=${i++}`); vals.push(startCommand); }
+    if (githubUrl !== undefined)   { fields.push(`github_url=${i++}`);    vals.push(githubUrl); }
+    if (autoRestart !== undefined) { fields.push(`auto_restart=${i++}`);  vals.push(!!autoRestart); }
+    if (!fields.length) return res.json({ message: "Nothing to update" });
+    fields.push("updated_at=NOW()");
+    vals.push(req.params.id);
+    await pool.query(`UPDATE bp_projects SET ${fields.join(",")} WHERE id=${i}`, vals);
+    res.json({ message: "Settings updated" });
+  } catch (e) { res.status(500).json({ error: "Failed" }); }
+});
+
+// ─── Admin: System health ──────────────────────────────────────────────────
+
+app.get("/api/brucepanel/admin/system", auth, adminOnly, async (req, res) => {
+  try {
+    const os = await import("os");
+    const totalMem = os.totalmem();
+    const freeMem  = os.freemem();
+    const usedMem  = totalMem - freeMem;
+    const loadAvg  = os.loadavg();
+    const cpus     = os.cpus();
+    let diskUsed = 0;
+    function getDirSize(dir) {
+      try { for (const item of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, item.name);
+        if (item.isDirectory()) getDirSize(full);
+        else try { diskUsed += fs.statSync(full).size; } catch {}
+      }} catch {}
+    }
+    getDirSize(PROJECTS_DIR);
+    const [u, p, t, a] = await Promise.all([
+      pool.query("SELECT COUNT(*) FROM bp_users"),
+      pool.query("SELECT COUNT(*) FROM bp_projects"),
+      pool.query("SELECT COUNT(*), COALESCE(SUM(amount),0) as revenue FROM bp_transactions WHERE status='completed'"),
+      pool.query("SELECT COUNT(*) FROM bp_audit_log"),
+    ]);
+    res.json({
+      memory:  { total: totalMem, used: usedMem, free: freeMem, pct: Math.round(usedMem/totalMem*100) },
+      cpu:     { cores: cpus.length, model: cpus[0]?.model || "Unknown", loadAvg },
+      uptime:  os.uptime(),
+      disk:    { used: diskUsed },
+      running: processes.size,
+      users:   parseInt(u.rows[0].count),
+      projects:parseInt(p.rows[0].count),
+      transactions: parseInt(t.rows[0].count),
+      revenue: parseInt(t.rows[0].revenue || 0),
+      auditEntries: parseInt(a.rows[0].count),
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Admin: Promo codes ────────────────────────────────────────────────────
+
+app.get("/api/brucepanel/admin/promo", auth, adminOnly, async (req, res) => {
+  const r = await pool.query("SELECT * FROM bp_promo_codes ORDER BY created_at DESC");
+  res.json({ codes: r.rows });
+});
+
+app.post("/api/brucepanel/admin/promo", auth, adminOnly, async (req, res) => {
+  const { code, coins, maxUses = -1, expiresAt } = req.body;
+  if (!code || !coins) return res.status(400).json({ error: "Code and coins are required" });
+  try {
+    await pool.query(
+      "INSERT INTO bp_promo_codes (code,coins,max_uses,expires_at,created_by) VALUES ($1,$2,$3,$4,$5)",
+      [code.toUpperCase().trim(), parseInt(coins), parseInt(maxUses), expiresAt || null, req.userId]
+    );
+    auditLog(req.userId, "", "promo_create", `code:${code} coins:${coins}`, req.ip);
+    res.json({ message: "Promo code created" });
+  } catch (e) { res.status(400).json({ error: e.message.includes("unique") ? "Code already exists" : "Failed" }); }
+});
+
+app.delete("/api/brucepanel/admin/promo/:code", auth, adminOnly, async (req, res) => {
+  await pool.query("DELETE FROM bp_promo_codes WHERE code=$1", [req.params.code.toUpperCase()]);
+  auditLog(req.userId, "", "promo_delete", `code:${req.params.code}`, req.ip);
+  res.json({ message: "Deleted" });
+});
+
+// ─── Admin: Audit log ──────────────────────────────────────────────────────
+
+app.get("/api/brucepanel/admin/audit", auth, adminOnly, async (req, res) => {
+  try {
+    const page  = Math.max(1, parseInt(req.query.page || "1"));
+    const limit = 60;
+    const [r, c] = await Promise.all([
+      pool.query("SELECT * FROM bp_audit_log ORDER BY created_at DESC LIMIT $1 OFFSET $2", [limit, (page-1)*limit]),
+      pool.query("SELECT COUNT(*) FROM bp_audit_log"),
+    ]);
+    res.json({ logs: r.rows, total: parseInt(c.rows[0].count), page, pages: Math.ceil(c.rows[0].count / limit) });
+  } catch { res.json({ logs: [], total: 0, page: 1, pages: 1 }); }
+});
+
+// ─── Admin: Platform settings ──────────────────────────────────────────────
+
+app.get("/api/brucepanel/admin/platform", auth, adminOnly, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT key, value FROM bp_platform_settings");
+    const db = Object.fromEntries(r.rows.map(row => [row.key, row.value]));
+    const defaults = { maintenance:"false", registrations_enabled:"true", max_projects_per_user:"10", coin_per_referral:"25", free_app_slots:"2", min_password_length:"6" };
+    res.json({ settings: { ...defaults, ...db } });
+  } catch { res.json({ settings: {} }); }
+});
+
+app.put("/api/brucepanel/admin/platform", auth, adminOnly, async (req, res) => {
+  try {
+    const { settings } = req.body;
+    for (const [key, value] of Object.entries(settings || {})) {
+      await pool.query(
+        "INSERT INTO bp_platform_settings (key,value,updated_at) VALUES ($1,$2,NOW()) ON CONFLICT (key) DO UPDATE SET value=$2, updated_at=NOW()",
+        [key, String(value)]
+      );
+    }
+    auditLog(req.userId, "", "platform_settings", JSON.stringify(settings), req.ip);
+    res.json({ message: "Platform settings saved" });
+  } catch { res.status(500).json({ error: "Failed" }); }
+});
+
+// ─── Admin: Force control any project ─────────────────────────────────────
+
+app.get("/api/brucepanel/admin/projects/:id/logs", auth, adminOnly, async (req, res) => {
+  try {
+    const entry = processes.get(req.params.id);
+    const live  = entry?.logs || [];
+    const file  = readLogs(req.params.id, 200);
+    res.json({ logs: [...new Set([...file, ...live])].slice(-200) });
+  } catch { res.json({ logs: [] }); }
+});
+
+app.post("/api/brucepanel/admin/projects/:id/force-stop", auth, adminOnly, async (req, res) => {
+  try {
+    await stopProcess(req.params.id);
+    await pool.query("UPDATE bp_projects SET status='stopped', updated_at=NOW() WHERE id=$1", [req.params.id]);
+    const r = await pool.query("SELECT name FROM bp_projects WHERE id=$1", [req.params.id]);
+    auditLog(req.userId, "", "admin_force_stop", `project:${r.rows[0]?.name || req.params.id}`, req.ip);
+    res.json({ message: "Project stopped" });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post("/api/brucepanel/admin/projects/:id/force-start", auth, adminOnly, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT * FROM bp_projects WHERE id=$1", [req.params.id]);
+    const p = r.rows[0];
+    if (!p) return res.status(404).json({ error: "Not found" });
+    const dir = path.join(PROJECTS_DIR, req.params.id);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    await startProcess(req.params.id, dir, p.start_command, JSON.parse(p.env || "{}"));
+    await pool.query("UPDATE bp_projects SET status='running', updated_at=NOW() WHERE id=$1", [req.params.id]);
+    auditLog(req.userId, "", "admin_force_start", `project:${p.name}`, req.ip);
+    res.json({ message: "Project started" });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Admin: Impersonate user ───────────────────────────────────────────────
+
+app.post("/api/brucepanel/admin/users/:id/impersonate", auth, adminOnly, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT id, username, role FROM bp_users WHERE id=$1", [req.params.id]);
+    const u = r.rows[0];
+    if (!u) return res.status(404).json({ error: "User not found" });
+    if (u.role === "admin" && req.userId !== u.id) return res.status(403).json({ error: "Cannot impersonate another admin" });
+    const token = jwt.sign({ userId: u.id }, JWT_SECRET, { expiresIn: "2h" });
+    auditLog(req.userId, "", "admin_impersonate", `target:${u.username}`, req.ip);
+    res.json({ token, user: { id: u.id, username: u.username, role: u.role } });
+  } catch { res.status(500).json({ error: "Failed" }); }
+});
+
+// ─── Admin: DM a user ─────────────────────────────────────────────────────
+
+app.post("/api/brucepanel/admin/users/:id/message", auth, adminOnly, async (req, res) => {
+  const { title, message, type = "info" } = req.body;
+  if (!title || !message) return res.status(400).json({ error: "Title and message required" });
+  try {
+    await pool.query(
+      "INSERT INTO bp_notifications (id,user_id,title,message,type) VALUES ($1,$2,$3,$4,$5)",
+      [uuidv4(), req.params.id, title, message, type]
+    );
+    res.json({ message: "Message sent to user" });
+  } catch { res.status(500).json({ error: "Failed" }); }
+});
+
 
 // ─── Static client ────────────────────────────────────────────────────────
 const clientDist = path.join(__dirname, "client", "dist");
