@@ -187,9 +187,14 @@ async function initDB() {
     `ALTER TABLE bp_users ADD COLUMN IF NOT EXISTS referred_by TEXT`,
     `ALTER TABLE bp_users ADD COLUMN IF NOT EXISTS free_apps_used INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE bp_projects ADD COLUMN IF NOT EXISTS is_free_slot BOOLEAN NOT NULL DEFAULT false`
+  ];
+  for (const sql of alters) {
+    try { await pool.query(sql); } catch {}
+  }
 
-    // New tables for advanced features
-    await pool.query(\`
+  // Create new tables
+  try {
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS bp_promo_codes (
         id SERIAL PRIMARY KEY,
         code TEXT UNIQUE NOT NULL,
@@ -199,9 +204,11 @@ async function initDB() {
         expires_at TIMESTAMP,
         created_by TEXT,
         created_at TIMESTAMP DEFAULT NOW()
-      )\`);
+      )`);
+  } catch (e) { console.error("Error creating bp_promo_codes:", e.message); }
 
-    await pool.query(\`
+  try {
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS bp_audit_log (
         id SERIAL PRIMARY KEY,
         user_id TEXT,
@@ -210,26 +217,28 @@ async function initDB() {
         details TEXT DEFAULT '',
         ip TEXT DEFAULT '',
         created_at TIMESTAMP DEFAULT NOW()
-      )\`);
+      )`);
+  } catch (e) { console.error("Error creating bp_audit_log:", e.message); }
 
-    await pool.query(\`
+  try {
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS bp_platform_settings (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL DEFAULT '',
         updated_at TIMESTAMP DEFAULT NOW()
-      )\`);
+      )`);
+  } catch (e) { console.error("Error creating bp_platform_settings:", e.message); }
 
-    for (const q of [
-      \`ALTER TABLE bp_projects ADD COLUMN IF NOT EXISTS auto_restart BOOLEAN DEFAULT FALSE\`,
-      \`ALTER TABLE bp_projects ADD COLUMN IF NOT EXISTS restart_count INTEGER DEFAULT 0\`,
-      \`ALTER TABLE bp_projects ADD COLUMN IF NOT EXISTS last_restart TIMESTAMP\`,
-      \`ALTER TABLE bp_users ADD COLUMN IF NOT EXISTS last_login TIMESTAMP\`,
-      \`ALTER TABLE bp_users ADD COLUMN IF NOT EXISTS bio TEXT DEFAULT ''\`,
-    ]) { try { await pool.query(q); } catch {} }
-,
+  // Additional column alterations
+  const extraAlters = [
+    `ALTER TABLE bp_projects ADD COLUMN IF NOT EXISTS auto_restart BOOLEAN DEFAULT FALSE`,
+    `ALTER TABLE bp_projects ADD COLUMN IF NOT EXISTS restart_count INTEGER DEFAULT 0`,
+    `ALTER TABLE bp_projects ADD COLUMN IF NOT EXISTS last_restart TIMESTAMP`,
+    `ALTER TABLE bp_users ADD COLUMN IF NOT EXISTS last_login TIMESTAMP`,
+    `ALTER TABLE bp_users ADD COLUMN IF NOT EXISTS bio TEXT DEFAULT ''`,
   ];
-  for (const sql of alters) {
-    try { await pool.query(sql); } catch {}
+  for (const q of extraAlters) {
+    try { await pool.query(q); } catch {}
   }
 
   // Seed default admin
@@ -1176,15 +1185,15 @@ app.put("/api/brucepanel/projects/:id/settings", auth, async (req, res) => {
     const { name, description, startCommand, githubUrl, autoRestart } = req.body;
     const fields = [], vals = [];
     let i = 1;
-    if (name !== undefined)        { fields.push(`name=${i++}`);          vals.push(name); }
-    if (description !== undefined) { fields.push(`description=${i++}`);   vals.push(description); }
-    if (startCommand !== undefined){ fields.push(`start_command=${i++}`); vals.push(startCommand); }
-    if (githubUrl !== undefined)   { fields.push(`github_url=${i++}`);    vals.push(githubUrl); }
-    if (autoRestart !== undefined) { fields.push(`auto_restart=${i++}`);  vals.push(!!autoRestart); }
+    if (name !== undefined)        { fields.push(`name=$${i++}`);          vals.push(name); }
+    if (description !== undefined) { fields.push(`description=$${i++}`);   vals.push(description); }
+    if (startCommand !== undefined){ fields.push(`start_command=$${i++}`); vals.push(startCommand); }
+    if (githubUrl !== undefined)   { fields.push(`github_url=$${i++}`);    vals.push(githubUrl); }
+    if (autoRestart !== undefined) { fields.push(`auto_restart=$${i++}`);  vals.push(!!autoRestart); }
     if (!fields.length) return res.json({ message: "Nothing to update" });
     fields.push("updated_at=NOW()");
     vals.push(req.params.id);
-    await pool.query(`UPDATE bp_projects SET ${fields.join(",")} WHERE id=${i}`, vals);
+    await pool.query(`UPDATE bp_projects SET ${fields.join(",")} WHERE id=$${i}`, vals);
     res.json({ message: "Settings updated" });
   } catch (e) { res.status(500).json({ error: "Failed" }); }
 });
@@ -1767,10 +1776,10 @@ app.get("/api/brucepanel/admin/users/search", auth, adminOnly, async (req, res) 
   try {
     let where = ["1=1"];
     const params = [];
-    if (q) { params.push(`%${q}%`); where.push(`(u.username ILIKE ${params.length} OR u.email ILIKE ${params.length})`); }
-    if (role) { params.push(role); where.push(`u.role=${params.length}`); }
-    if (minCoins) { params.push(parseInt(minCoins)); where.push(`u.coins >= ${params.length}`); }
-    if (maxCoins) { params.push(parseInt(maxCoins)); where.push(`u.coins <= ${params.length}`); }
+    if (q) { params.push(`%${q}%`); where.push(`(u.username ILIKE $${params.length} OR u.email ILIKE $${params.length})`); }
+    if (role) { params.push(role); where.push(`u.role=$${params.length}`); }
+    if (minCoins) { params.push(parseInt(minCoins)); where.push(`u.coins >= $${params.length}`); }
+    if (maxCoins) { params.push(parseInt(maxCoins)); where.push(`u.coins <= $${params.length}`); }
     if (banned === "true")  where.push("u.is_banned = true");
     if (banned === "false") where.push("u.is_banned = false");
     const r = await pool.query(`
@@ -1888,7 +1897,7 @@ async function initSupport() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS bp_support_sessions (
       id           VARCHAR(36) PRIMARY KEY,
-      user_id      INTEGER REFERENCES bp_users(id) ON DELETE CASCADE,
+      user_id      TEXT REFERENCES bp_users(id) ON DELETE CASCADE,
       subject      TEXT NOT NULL DEFAULT 'Support Request',
       status       VARCHAR(20) DEFAULT 'open',
       unread_admin INTEGER DEFAULT 0,
@@ -1901,7 +1910,7 @@ async function initSupport() {
     CREATE TABLE IF NOT EXISTS bp_support_messages (
       id         VARCHAR(36) PRIMARY KEY,
       session_id VARCHAR(36) REFERENCES bp_support_sessions(id) ON DELETE CASCADE,
-      user_id    INTEGER,
+      user_id    TEXT,
       is_admin   BOOLEAN DEFAULT FALSE,
       message    TEXT NOT NULL,
       created_at TIMESTAMPTZ DEFAULT NOW()
