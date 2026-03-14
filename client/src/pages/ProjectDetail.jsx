@@ -42,6 +42,137 @@ function FileNode({ node, depth = 0, onSelect, selected }) {
   );
 }
 
+// ─── npm Package Manager Component ────────────────────────────────────────
+function NpmManager({ projectId, onLog }) {
+  const [pkgs, setPkgs] = useState([]);
+  const [input, setInput] = useState("");
+  const [dev, setDev] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [msg, setMsg] = useState("");
+
+  function flash(m) { setMsg(m); setTimeout(() => setMsg(""), 5000); }
+
+  useEffect(() => {
+    api.npmPackages(projectId).then(r => { setPkgs(r.packages || []); setLoading(false); }).catch(() => setLoading(false));
+  }, [projectId]);
+
+  async function install(e) {
+    e.preventDefault();
+    if (!input.trim()) return;
+    const packages = input.trim().split(/[\s,]+/).filter(Boolean);
+    try {
+      await api.npmInstall(projectId, packages, dev);
+      flash(`Installing ${packages.join(", ")}... Check Logs tab for progress.`);
+      setInput(""); onLog();
+    } catch (e) { flash("❌ " + e.message); }
+  }
+
+  async function uninstall(name) {
+    if (!confirm(`Uninstall ${name}?`)) return;
+    try { await api.npmUninstall(projectId, [name]); setPkgs(p => p.filter(x => x.name !== name)); flash(`Uninstalled ${name}. Check Logs tab.`); onLog(); }
+    catch (e) { flash("❌ " + e.message); }
+  }
+
+  return (
+    <div className="px-4 sm:px-6 pb-8 space-y-4">
+      {msg && <div className="bg-[#1a1a24] border border-[#2d2d3e] rounded-lg px-4 py-2.5 text-sm text-green-400">{msg}</div>}
+      <div className="bg-[#111118] border border-[#2d2d3e] rounded-xl p-5 space-y-3">
+        <h3 className="text-white font-semibold">📦 Install Package</h3>
+        <form onSubmit={install} className="flex gap-2 flex-wrap">
+          <input value={input} onChange={e => setInput(e.target.value)} placeholder="e.g. express axios lodash"
+            className="flex-1 min-w-0 bg-[#1a1a24] border border-[#2d2d3e] rounded-lg px-4 py-2.5 text-white font-mono text-sm focus:outline-none focus:border-blue-500" />
+          <label className="flex items-center gap-1.5 text-slate-400 text-sm px-1 cursor-pointer">
+            <input type="checkbox" checked={dev} onChange={e => setDev(e.target.checked)} className="accent-blue-500" />
+            --save-dev
+          </label>
+          <button type="submit" className="bg-blue-600 hover:bg-blue-500 text-white px-5 py-2.5 rounded-lg text-sm font-medium transition">Install</button>
+        </form>
+        <p className="text-slate-600 text-xs">Separate multiple packages with spaces. Installation output appears in the Logs tab.</p>
+      </div>
+      <div className="bg-[#111118] border border-[#2d2d3e] rounded-xl">
+        <div className="px-5 py-3 border-b border-[#2d2d3e] flex items-center justify-between">
+          <h3 className="text-white font-semibold text-sm">Installed Packages</h3>
+          <span className="text-slate-500 text-xs">{pkgs.length} packages</span>
+        </div>
+        {loading ? <div className="text-center py-8 text-slate-600 text-sm animate-pulse">Loading...</div> :
+         pkgs.length === 0 ? <div className="text-center py-8 text-slate-600 text-sm">No packages found (no package.json?)</div> :
+          <div className="divide-y divide-[#2d2d3e]/50 max-h-80 overflow-y-auto">
+            {pkgs.map(p => (
+              <div key={p.name} className="flex items-center justify-between px-5 py-2.5 hover:bg-[#1a1a24] transition">
+                <div className="flex items-center gap-3">
+                  <span className="text-slate-200 text-sm font-mono">{p.name}</span>
+                  <span className="text-slate-600 text-xs">{p.version}</span>
+                  {p.dev && <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-900/30 text-blue-400">dev</span>}
+                </div>
+                <button onClick={() => uninstall(p.name)} className="text-red-400 hover:text-red-300 text-xs px-2 py-1 hover:bg-red-900/20 rounded transition">Remove</button>
+              </div>
+            ))}
+          </div>
+        }
+      </div>
+    </div>
+  );
+}
+
+// ─── Webhook Panel Component ───────────────────────────────────────────────
+function WebhookPanel({ projectId }) {
+  const [webhook, setWebhook] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    api.getWebhook(projectId).then(setWebhook).catch(() => {}).finally(() => setLoading(false));
+  }, [projectId]);
+
+  async function regen() {
+    if (!confirm("Regenerate webhook URL? The old URL will stop working.")) return;
+    try { setWebhook(await api.regenWebhook(projectId)); } catch {}
+  }
+
+  function copy(text) {
+    navigator.clipboard.writeText(text).then(() => { setCopied(true); setTimeout(() => setCopied(false), 2000); });
+  }
+
+  return (
+    <div className="px-4 sm:px-6 pb-8">
+      <div className="bg-[#111118] border border-[#2d2d3e] rounded-xl p-6 space-y-5">
+        <div>
+          <h3 className="text-white font-semibold">🔗 Auto-Deploy Webhook</h3>
+          <p className="text-slate-500 text-sm mt-1">Connect this URL to GitHub → Settings → Webhooks. Every push to your repo will automatically re-pull and restart this project.</p>
+        </div>
+        {loading ? <div className="text-slate-600 text-sm animate-pulse">Loading...</div> : webhook && (
+          <>
+            <div>
+              <label className="text-slate-400 text-xs block mb-1.5">Webhook URL</label>
+              <div className="flex gap-2">
+                <input readOnly value={webhook.webhookUrl}
+                  className="flex-1 bg-[#0d0d14] border border-[#2d2d3e] rounded-lg px-4 py-2.5 text-green-400 font-mono text-xs focus:outline-none" />
+                <button onClick={() => copy(webhook.webhookUrl)} className="bg-[#1a1a24] hover:bg-[#22222f] border border-[#2d2d3e] text-slate-300 hover:text-white px-4 py-2 rounded-lg text-sm transition">
+                  {copied ? "✅ Copied" : "Copy"}
+                </button>
+              </div>
+            </div>
+            <div className="bg-blue-900/10 border border-blue-800/40 rounded-lg p-4 space-y-2">
+              <p className="text-blue-300 text-sm font-medium">GitHub Setup</p>
+              <ol className="text-slate-400 text-sm space-y-1.5 list-decimal list-inside">
+                <li>Go to your GitHub repo → <strong>Settings → Webhooks → Add webhook</strong></li>
+                <li>Paste the URL above as the <strong>Payload URL</strong></li>
+                <li>Set <strong>Content type</strong> to <code className="bg-[#2d2d3e] px-1 rounded text-xs">application/json</code></li>
+                <li>Choose <strong>Just the push event</strong></li>
+                <li>Click <strong>Add webhook</strong> — you're done!</li>
+              </ol>
+            </div>
+            <div className="flex items-center justify-between">
+              <p className="text-slate-600 text-xs">Webhook secret for security reference: <span className="font-mono text-slate-500">{webhook.secret?.slice(0,8)}...</span></p>
+              <button onClick={regen} className="text-xs text-red-400 hover:text-red-300 border border-red-900 px-3 py-1.5 rounded-lg hover:bg-red-900/20 transition">↺ Regenerate URL</button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function ProjectDetail() {
   const { id } = useParams();
   const [project, setProject] = useState(null);
@@ -180,10 +311,10 @@ export default function ProjectDetail() {
 
         {/* Tabs */}
         <div className="flex border-b border-[#2d2d3e] mb-6 overflow-x-auto gap-1">
-          {["logs","files","env","settings"].map(t => (
+          {["logs","files","env","npm","webhook","settings"].map(t => (
             <button key={t} onClick={() => setTab(t)}
               className={`px-4 py-2.5 text-sm font-medium border-b-2 transition capitalize whitespace-nowrap ${tab === t ? "border-blue-500 text-blue-400" : "border-transparent text-slate-400 hover:text-white"}`}>
-              {t === "files" ? "📁 Files" : t === "logs" ? "📋 Logs" : t === "env" ? "🔐 Env" : "⚙️ Settings"}
+              {t === "files" ? "📁 Files" : t === "logs" ? "📋 Logs" : t === "env" ? "🔐 Env" : t === "npm" ? "📦 npm" : t === "webhook" ? "🔗 Webhook" : "⚙️ Settings"}
             </button>
           ))}
         </div>
@@ -370,6 +501,12 @@ export default function ProjectDetail() {
           </div>
         )}
       </div>
+
+      {/* npm Package Manager */}
+      {tab === "npm" && project && <NpmManager projectId={id} onLog={() => setTab("logs")} />}
+
+      {/* Webhook */}
+      {tab === "webhook" && project && <WebhookPanel projectId={id} />}
 
       <footer className="text-center py-6 text-slate-600 text-xs">
         BrucePanel by <a href="https://wa.me/254787527753" target="_blank" rel="noreferrer" className="hover:text-slate-400">Bruce Bera</a> — Bera Tech Org
