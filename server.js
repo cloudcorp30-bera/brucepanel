@@ -532,6 +532,55 @@ app.put("/api/brucepanel/projects/:id/env", auth, async (req, res) => {
 
 
 // ─── File manager routes ──────────────────────────────────────────────────
+// Deploy from GitHub (force re-clone)
+app.post("/api/brucepanel/projects/:id/deploy", auth, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT * FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId]);
+    const p = r.rows[0];
+    if (!p) return res.status(404).json({ error: "Not found" });
+    const githubUrl = req.body.githubUrl || p.github_url;
+    if (!githubUrl) return res.status(400).json({ error: "No GitHub URL provided" });
+    // Update URL in DB
+    await pool.query("UPDATE bp_projects SET github_url=$1, status='installing', updated_at=NOW() WHERE id=$2", [githubUrl, req.params.id]);
+    // Stop existing process
+    await stopProcess(req.params.id);
+    const dir = path.join(PROJECTS_DIR, req.params.id);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    // Remove .git to force fresh clone
+    const gitDir = path.join(dir, ".git");
+    if (fs.existsSync(gitDir)) fs.rmSync(gitDir, { recursive: true, force: true });
+    appendLog(req.params.id, "[BrucePanel] Starting deploy from " + githubUrl);
+    res.json({ message: "Deploy started" });
+    // Clone in background
+    setImmediate(async () => {
+      try {
+        await new Promise((resolve, reject) => {
+          const git = spawn("git", ["clone", githubUrl, "."], { cwd: dir });
+          git.stdout.on("data", d => appendLog(req.params.id, d.toString().trim()));
+          git.stderr.on("data", d => appendLog(req.params.id, d.toString().trim()));
+          git.on("exit", code => code === 0 ? resolve() : reject(new Error("Clone failed")));
+        });
+        if (fs.existsSync(path.join(dir, "package.json"))) {
+          appendLog(req.params.id, "[BrucePanel] Running npm install...");
+          await new Promise((resolve) => {
+            const npm = spawn("npm", ["install"], { cwd: dir });
+            npm.stdout.on("data", d => appendLog(req.params.id, d.toString().trim()));
+            npm.stderr.on("data", d => appendLog(req.params.id, d.toString().trim()));
+            npm.on("exit", resolve);
+          });
+        }
+        const envVars = JSON.parse(p.env || "{}");
+        await startProcess(req.params.id, dir, p.start_command, envVars);
+        await pool.query("UPDATE bp_projects SET status='running', updated_at=NOW() WHERE id=$1", [req.params.id]);
+        appendLog(req.params.id, "[BrucePanel] Deploy complete!");
+      } catch (e) {
+        await pool.query("UPDATE bp_projects SET status='error', updated_at=NOW() WHERE id=$1", [req.params.id]);
+        appendLog(req.params.id, "[BrucePanel] Deploy failed: " + e.message);
+      }
+    });
+  } catch (e) { res.status(500).json({ error: e.message || "Failed" }); }
+});
+
 
 // Upload ZIP or single file
 app.post("/api/brucepanel/projects/:id/upload", auth, upload.single("file"), async (req, res) => {
