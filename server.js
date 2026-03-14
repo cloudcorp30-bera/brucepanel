@@ -1,3 +1,4 @@
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import bcrypt from "bcryptjs";
@@ -12,398 +13,791 @@ import pg from "pg";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const { Pool } = pg;
 
+// ─── Config ────────────────────────────────────────────────────────────────
+const DB_URL = process.env.NEON_DATABASE_URL || process.env.DATABASE_URL;
+if (!DB_URL) { console.error("DATABASE_URL is required"); process.exit(1); }
+
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL?.includes("neon") ? { rejectUnauthorized: false } : false,
+  connectionString: DB_URL,
+  ssl: DB_URL.includes("neon.tech") ? { rejectUnauthorized: false } : false,
 });
 
-const JWT_SECRET = process.env.JWT_SECRET || "brucepanel-secret-change-me";
-const PROJECTS_DIR = path.join(__dirname, "bp_projects");
-const MAX_LOG_FILE_BYTES = 512 * 1024;
-const PORT = process.env.PORT || 3000;
+const JWT_SECRET      = process.env.JWT_SECRET || "brucepanel-secret-BeraTech2026-changeme";
+const PROJECTS_DIR    = path.join(__dirname, "bp_projects");
+const PORT            = process.env.PORT || 3000;
+const PAYHERO_AUTH    = process.env.PAYHERO_AUTH || "Basic bjB4clNmY1V5aEFiS2dRcnhDZ2U6d1VrV01vMERoUko0akJ0OVZFTjVUc2VoQ0xkTGdab2tLRWFMRkMxbQ==";
+const PAYHERO_CHANNEL = parseInt(process.env.PAYHERO_CHANNEL_ID || "3762");
+const PAYHERO_BASE    = process.env.PAYHERO_BASE || "https://backend.payhero.co.ke/api/v2";
+const MAX_LOG_BYTES   = 512 * 1024;
+
+const PLANS = [
+  { id: "weekly",  label: "Weekly",  price: 50,   coins: 100,  description: "100 BB Coins · 7 days" },
+  { id: "monthly", label: "Monthly", price: 150,  coins: 400,  description: "400 BB Coins · 30 days" },
+  { id: "yearly",  label: "Yearly",  price: 1000, coins: 3000, description: "3000 BB Coins · 365 days" },
+];
 
 if (!fs.existsSync(PROJECTS_DIR)) fs.mkdirSync(PROJECTS_DIR, { recursive: true });
 
-const processes = new Map();
-const sseClients = new Map(); // projectId => Set<res>
+const processes  = new Map(); // projectId → { proc, logs }
+const sseClients = new Map(); // projectId → Set<res>
 
-// ─── Log helpers ───────────────────────────────────────────────
+// ─── Log helpers ──────────────────────────────────────────────────────────
 function logFilePath(projectId) {
   const dir = path.join(PROJECTS_DIR, projectId);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   return path.join(dir, "brucepanel.log");
 }
-
-function appendLogToFile(projectId, line) {
+function appendLog(projectId, line) {
   try {
     const file = logFilePath(projectId);
     fs.appendFileSync(file, line + "\n");
     const stat = fs.statSync(file);
-    if (stat.size > MAX_LOG_FILE_BYTES) {
+    if (stat.size > MAX_LOG_BYTES) {
       const content = fs.readFileSync(file, "utf8");
-      const trimmed = content.slice(content.length / 2);
-      const nl = trimmed.indexOf("\n");
-      fs.writeFileSync(file, "--- log rotated ---\n" + trimmed.slice(nl + 1));
+      const half = content.slice(content.length / 2);
+      fs.writeFileSync(file, "--- log rotated ---\n" + half.slice(half.indexOf("\n") + 1));
     }
   } catch {}
 }
-
-function readLogsFromFile(projectId, lines = 200) {
+function readLogs(projectId, lines = 200) {
   try {
     const file = logFilePath(projectId);
     if (!fs.existsSync(file)) return [];
-    const content = fs.readFileSync(file, "utf8");
-    return content.split("\n").filter(Boolean).slice(-lines);
+    return fs.readFileSync(file, "utf8").split("\n").filter(Boolean).slice(-lines);
   } catch { return []; }
 }
-
 function addLog(projectId, line) {
-  const timestamped = `[${new Date().toISOString()}] ${line}`;
+  const ts = `[${new Date().toISOString()}] ${line}`;
   const entry = processes.get(projectId);
-  if (entry) { entry.logs.push(timestamped); if (entry.logs.length > 500) entry.logs.shift(); }
-  appendLogToFile(projectId, timestamped);
+  if (entry) { entry.logs.push(ts); if (entry.logs.length > 500) entry.logs.shift(); }
+  appendLog(projectId, ts);
   const clients = sseClients.get(projectId);
   if (clients) {
-    const payload = `data: ${JSON.stringify({ log: timestamped })}\n\n`;
+    const payload = `data: ${JSON.stringify({ log: ts })}\n\n`;
     for (const res of clients) { try { res.write(payload); } catch {} }
   }
 }
 
-// ─── DB init ────────────────────────────────────────────────────
+// ─── DB init ─────────────────────────────────────────────────────────────
 async function initDB() {
-  await pool.query(`CREATE TABLE IF NOT EXISTS bp_users (id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT NOW())`);
-  await pool.query(`CREATE TABLE IF NOT EXISTS bp_projects (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES bp_users(id) ON DELETE CASCADE, name TEXT NOT NULL, description TEXT DEFAULT '', start_command TEXT NOT NULL DEFAULT 'npm start', github_url TEXT DEFAULT '', auto_update BOOLEAN DEFAULT false, status TEXT NOT NULL DEFAULT 'idle', port INTEGER, env TEXT NOT NULL DEFAULT '{}', created_at TIMESTAMP NOT NULL DEFAULT NOW(), updated_at TIMESTAMP NOT NULL DEFAULT NOW())`);
+  // Create all tables
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bp_users (
+      id TEXT PRIMARY KEY,
+      username TEXT NOT NULL UNIQUE,
+      email TEXT DEFAULT '',
+      password_hash TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'user',
+      coins INTEGER NOT NULL DEFAULT 0,
+      is_banned BOOLEAN NOT NULL DEFAULT false,
+      referral_code TEXT UNIQUE,
+      referred_by TEXT,
+      free_apps_used INTEGER NOT NULL DEFAULT 0,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bp_projects (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES bp_users(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      description TEXT DEFAULT '',
+      start_command TEXT NOT NULL DEFAULT 'npm start',
+      github_url TEXT DEFAULT '',
+      auto_update BOOLEAN DEFAULT false,
+      status TEXT NOT NULL DEFAULT 'idle',
+      port INTEGER,
+      env TEXT NOT NULL DEFAULT '{}',
+      is_free_slot BOOLEAN NOT NULL DEFAULT false,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bp_transactions (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES bp_users(id) ON DELETE CASCADE,
+      plan TEXT NOT NULL,
+      amount INTEGER NOT NULL DEFAULT 0,
+      coins INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      phone_number TEXT DEFAULT '',
+      payment_ref TEXT DEFAULT '',
+      checkout_request_id TEXT DEFAULT '',
+      notes TEXT DEFAULT '',
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bp_notifications (
+      id TEXT PRIMARY KEY,
+      user_id TEXT,
+      title TEXT NOT NULL,
+      message TEXT NOT NULL,
+      type TEXT NOT NULL DEFAULT 'info',
+      read BOOLEAN NOT NULL DEFAULT false,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bp_referrals (
+      id TEXT PRIMARY KEY,
+      referrer_id TEXT NOT NULL REFERENCES bp_users(id) ON DELETE CASCADE,
+      referee_id TEXT NOT NULL UNIQUE REFERENCES bp_users(id) ON DELETE CASCADE,
+      status TEXT NOT NULL DEFAULT 'completed',
+      coins_awarded INTEGER NOT NULL DEFAULT 25,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    )`);
+
+  // Add missing columns for older deployments
+  const alters = [
+    `ALTER TABLE bp_users ADD COLUMN IF NOT EXISTS email TEXT DEFAULT ''`,
+    `ALTER TABLE bp_users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user'`,
+    `ALTER TABLE bp_users ADD COLUMN IF NOT EXISTS coins INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE bp_users ADD COLUMN IF NOT EXISTS is_banned BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE bp_users ADD COLUMN IF NOT EXISTS referral_code TEXT`,
+    `ALTER TABLE bp_users ADD COLUMN IF NOT EXISTS referred_by TEXT`,
+    `ALTER TABLE bp_users ADD COLUMN IF NOT EXISTS free_apps_used INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE bp_projects ADD COLUMN IF NOT EXISTS is_free_slot BOOLEAN NOT NULL DEFAULT false`,
+  ];
+  for (const sql of alters) {
+    try { await pool.query(sql); } catch {}
+  }
+
+  // Seed default admin
+  try {
+    const adminHash = await bcrypt.hash("BeraPanelAdmin2026!", 10);
+    await pool.query(`
+      INSERT INTO bp_users (id, username, email, password_hash, role, coins, referral_code, free_apps_used)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      ON CONFLICT (username) DO NOTHING
+    `, ["admin-001", "admin", "admin@beratech.co.ke", adminHash, "admin", 99999, "BRUCEADMIN", 0]);
+  } catch {}
+
   console.log("✅ Database initialized");
 }
 
-// ─── Auth ────────────────────────────────────────────────────────
+// ─── Helpers ─────────────────────────────────────────────────────────────
+function makeRef() {
+  return Math.random().toString(36).slice(2, 8).toUpperCase();
+}
+async function notify(userId, title, message, type = "info") {
+  try {
+    await pool.query(
+      `INSERT INTO bp_notifications (id, user_id, title, message, type) VALUES ($1,$2,$3,$4,$5)`,
+      [uuidv4(), userId || null, title, message, type]
+    );
+  } catch {}
+}
+
+// ─── Auth middleware ──────────────────────────────────────────────────────
 function auth(req, res, next) {
   const token = req.headers.authorization?.replace("Bearer ", "");
   if (!token) return res.status(401).json({ error: "Unauthorized" });
-  try { const { userId } = jwt.verify(token, JWT_SECRET); req.userId = userId; next(); }
-  catch { res.status(401).json({ error: "Invalid token" }); }
+  try {
+    const { userId } = jwt.verify(token, JWT_SECRET);
+    req.userId = userId;
+    next();
+  } catch { res.status(401).json({ error: "Invalid token" }); }
+}
+async function adminOnly(req, res, next) {
+  const u = await pool.query("SELECT role FROM bp_users WHERE id=$1", [req.userId]);
+  if (!u.rows[0] || !["admin","moderator"].includes(u.rows[0].role))
+    return res.status(403).json({ error: "Admin only" });
+  req.userRole = u.rows[0].role;
+  next();
 }
 
-// ─── Process management ──────────────────────────────────────────
+// ─── Process management ───────────────────────────────────────────────────
 function stopProcess(projectId) {
   const entry = processes.get(projectId);
   if (!entry?.proc) return Promise.resolve();
   processes.delete(projectId);
   return new Promise((resolve) => {
-    const proc = entry.proc;
-    let resolved = false;
-    const done = () => { if (!resolved) { resolved = true; resolve(); } };
-    proc.once("exit", done);
-    try { proc.kill("SIGTERM"); } catch {}
-    const killer = setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 3000);
-    proc.once("exit", () => clearTimeout(killer));
-    setTimeout(done, 3500);
+    let done = false;
+    const finish = () => { if (!done) { done = true; resolve(); } };
+    entry.proc.once("exit", finish);
+    entry.proc.kill("SIGTERM");
+    setTimeout(() => { try { entry.proc.kill("SIGKILL"); } catch {} finish(); }, 5000);
   });
 }
 
-async function startProcess(projectId, startCommand, env) {
+async function startProcess(projectId, dir, command, envVars = {}) {
   await stopProcess(projectId);
-  const dir = path.join(PROJECTS_DIR, projectId);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  await pool.query("UPDATE bp_projects SET status='running', updated_at=NOW() WHERE id=$1", [projectId]);
-  const [cmd, ...args] = startCommand.split(" ");
-  const proc = spawn(cmd, args, { cwd: dir, env: { ...process.env, ...env }, shell: true });
-  processes.set(projectId, { proc, logs: [], startedAt: new Date() });
-  addLog(projectId, `▶ Starting: ${startCommand}`);
-  proc.stdout?.on("data", d => d.toString().split("\n").filter(Boolean).forEach(l => addLog(projectId, l)));
-  proc.stderr?.on("data", d => d.toString().split("\n").filter(Boolean).forEach(l => addLog(projectId, `[stderr] ${l}`)));
-  proc.on("exit", code => {
-    if (!processes.has(projectId)) return;
-    addLog(projectId, `⏹ Process exited with code ${code}`);
-    pool.query("UPDATE bp_projects SET status=$1, updated_at=NOW() WHERE id=$2", [code === 0 ? "stopped" : "error", projectId]).catch(() => {});
+  const parts = command.split(" ");
+  const proc = spawn(parts[0], parts.slice(1), {
+    cwd: dir, env: { ...process.env, ...envVars },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  processes.set(projectId, { proc, logs: [] });
+  const onData = (data) => addLog(projectId, data.toString().trim());
+  proc.stdout.on("data", onData);
+  proc.stderr.on("data", onData);
+  proc.on("exit", async (code) => {
+    addLog(projectId, `Process exited with code ${code}`);
+    processes.delete(projectId);
+    await pool.query("UPDATE bp_projects SET status='stopped', updated_at=NOW() WHERE id=$1", [projectId]);
+  });
+  proc.on("error", async (err) => {
+    addLog(projectId, `Process error: ${err.message}`);
+    processes.delete(projectId);
+    await pool.query("UPDATE bp_projects SET status='error', updated_at=NOW() WHERE id=$1", [projectId]);
   });
 }
 
-function runInstall(projectId, dir, env, thenStart, startCommand) {
-  pool.query("UPDATE bp_projects SET status='installing', updated_at=NOW() WHERE id=$1", [projectId]).catch(() => {});
-  if (!processes.has(projectId)) processes.set(projectId, { proc: null, logs: [], startedAt: null });
-  const pkgLock = fs.existsSync(path.join(dir, "package-lock.json"));
-  const installCmd = pkgLock ? "npm ci" : "npm install";
-  addLog(projectId, `📦 Running ${installCmd}...`);
-  const p = spawn(installCmd, [], { cwd: dir, env: { ...process.env, ...env }, shell: true });
-  p.stdout?.on("data", d => d.toString().split("\n").filter(Boolean).forEach(l => addLog(projectId, l)));
-  p.stderr?.on("data", d => d.toString().split("\n").filter(Boolean).forEach(l => addLog(projectId, l)));
-  p.on("exit", code => {
-    if (code === 0) {
-      addLog(projectId, "✅ Dependencies installed successfully");
-      if (thenStart && startCommand) startProcess(projectId, startCommand, env);
-      else pool.query("UPDATE bp_projects SET status='stopped', updated_at=NOW() WHERE id=$1", [projectId]).catch(() => {});
-    } else {
-      addLog(projectId, `❌ npm install failed (exit code ${code})`);
-      pool.query("UPDATE bp_projects SET status='error', updated_at=NOW() WHERE id=$1", [projectId]).catch(() => {});
-    }
-  });
-}
-
-function runDepsCommand(projectId, dir, env, cmd, label) {
-  pool.query("UPDATE bp_projects SET status='installing', updated_at=NOW() WHERE id=$1", [projectId]).catch(() => {});
-  if (!processes.has(projectId)) processes.set(projectId, { proc: null, logs: [], startedAt: null });
-  addLog(projectId, `🔄 ${label}...`);
-  const p = spawn(cmd, [], { cwd: dir, env: { ...process.env, ...env }, shell: true });
-  p.stdout?.on("data", d => d.toString().split("\n").filter(Boolean).forEach(l => addLog(projectId, l)));
-  p.stderr?.on("data", d => d.toString().split("\n").filter(Boolean).forEach(l => addLog(projectId, l)));
-  p.on("exit", code => {
-    if (code === 0) {
-      addLog(projectId, `✅ ${label} completed`);
-      pool.query("UPDATE bp_projects SET status='stopped', updated_at=NOW() WHERE id=$1", [projectId]).catch(() => {});
-    } else {
-      addLog(projectId, `❌ ${label} failed (exit code ${code})`);
-      pool.query("UPDATE bp_projects SET status='error', updated_at=NOW() WHERE id=$1", [projectId]).catch(() => {});
-    }
-  });
-}
-
-function deployFromGitHub(projectId, githubUrl, startCommand, env, installDeps) {
-  const dir = path.join(PROJECTS_DIR, projectId);
-  if (!processes.has(projectId)) processes.set(projectId, { proc: null, logs: [], startedAt: null });
-  pool.query("UPDATE bp_projects SET status='installing', github_url=$1, updated_at=NOW() WHERE id=$2", [githubUrl, projectId]).catch(() => {});
-  addLog(projectId, `🔗 Cloning ${githubUrl}...`);
-  const tmp = path.join(PROJECTS_DIR, `${projectId}_tmp`);
-  if (fs.existsSync(tmp)) fs.rmSync(tmp, { recursive: true, force: true });
-  const p = spawn("git", ["clone", "--depth=1", githubUrl, tmp], { env: process.env, shell: true });
-  p.stdout?.on("data", d => d.toString().split("\n").filter(Boolean).forEach(l => addLog(projectId, l)));
-  p.stderr?.on("data", d => d.toString().split("\n").filter(Boolean).forEach(l => addLog(projectId, l)));
-  p.on("exit", code => {
-    if (code !== 0) { addLog(projectId, "❌ Git clone failed"); pool.query("UPDATE bp_projects SET status='error', updated_at=NOW() WHERE id=$1", [projectId]).catch(() => {}); return; }
-    addLog(projectId, "✅ Clone successful. Copying files...");
-    fs.rmSync(dir, { recursive: true, force: true });
-    fs.renameSync(tmp, dir);
-    if (installDeps && fs.existsSync(path.join(dir, "package.json"))) runInstall(projectId, dir, env, true, startCommand);
-    else startProcess(projectId, startCommand, env);
-  });
-}
-
-function formatProject(p) {
-  const entry = processes.get(p.id);
-  let uptime = "";
-  if (entry?.startedAt) {
-    const s = Math.floor((Date.now() - entry.startedAt.getTime()) / 1000);
-    uptime = s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s/60)}m ${s%60}s` : `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`;
-  }
-  return { ...p, uptime };
-}
-
-// ─── Express app ────────────────────────────────────────────────
+// ─── App ──────────────────────────────────────────────────────────────────
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Auth
+// ─── Auth routes ──────────────────────────────────────────────────────────
+
 app.post("/api/brucepanel/auth/register", async (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) return res.status(400).json({ error: "Username and password required" });
   try {
+    const { username, password, email = "", referralCode = "" } = req.body;
+    if (!username || !password) return res.status(400).json({ error: "Username and password required" });
+    if (username.length < 3) return res.status(400).json({ error: "Username must be at least 3 characters" });
+    if (password.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters" });
+
     const existing = await pool.query("SELECT id FROM bp_users WHERE username=$1", [username]);
-    if (existing.rows.length > 0) return res.status(400).json({ error: "Username already taken" });
+    if (existing.rows.length) return res.status(400).json({ error: "Username already taken" });
+
+    const hash = await bcrypt.hash(password, 10);
     const id = uuidv4();
-    const [user] = (await pool.query("INSERT INTO bp_users(id,username,password_hash) VALUES($1,$2,$3) RETURNING *", [id, username, await bcrypt.hash(password, 10)])).rows;
-    res.json({ token: jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: "7d" }), user: { id: user.id, username: user.username, createdAt: user.created_at } });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    const myRef = makeRef();
+    let referredBy = null;
+
+    await pool.query(
+      `INSERT INTO bp_users (id, username, email, password_hash, role, coins, referral_code, referred_by, free_apps_used)
+       VALUES ($1,$2,$3,$4,'user',0,$5,$6,0)`,
+      [id, username, email, hash, myRef, null]
+    );
+
+    // Handle referral
+    if (referralCode) {
+      const referrer = await pool.query(
+        "SELECT id FROM bp_users WHERE referral_code=$1 AND id != $2",
+        [referralCode.toUpperCase(), id]
+      );
+      if (referrer.rows.length) {
+        referredBy = referrer.rows[0].id;
+        await pool.query("UPDATE bp_users SET referred_by=$1 WHERE id=$2", [referredBy, id]);
+        await pool.query("UPDATE bp_users SET coins=coins+25 WHERE id=$1", [referredBy]);
+        await pool.query(
+          "INSERT INTO bp_referrals (id,referrer_id,referee_id,coins_awarded) VALUES ($1,$2,$3,25)",
+          [uuidv4(), referredBy, id]
+        );
+        await notify(referredBy, "Referral Bonus!", `${username} used your referral code. +25 BB Coins added!`, "success");
+      }
+    }
+
+    const token = jwt.sign({ userId: id }, JWT_SECRET, { expiresIn: "30d" });
+    const user = { id, username, email, role: "user", coins: 0, isBanned: false, referralCode: myRef, freeAppsUsed: 0 };
+    res.json({ token, user });
+  } catch (e) { console.error(e); res.status(500).json({ error: "Registration failed" }); }
 });
 
 app.post("/api/brucepanel/auth/login", async (req, res) => {
-  const { username, password } = req.body;
   try {
-    const user = (await pool.query("SELECT * FROM bp_users WHERE username=$1", [username])).rows[0];
-    if (!user || !(await bcrypt.compare(password, user.password_hash))) return res.status(401).json({ error: "Invalid credentials" });
-    res.json({ token: jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: "7d" }), user: { id: user.id, username: user.username, createdAt: user.created_at } });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    const { username, password } = req.body;
+    const r = await pool.query(
+      "SELECT id, username, email, password_hash, role, coins, is_banned, referral_code, free_apps_used FROM bp_users WHERE username=$1",
+      [username]
+    );
+    const u = r.rows[0];
+    if (!u || !(await bcrypt.compare(password, u.password_hash)))
+      return res.status(401).json({ error: "Invalid credentials" });
+    if (u.is_banned) return res.status(403).json({ error: "Account banned" });
+    const token = jwt.sign({ userId: u.id }, JWT_SECRET, { expiresIn: "30d" });
+    res.json({ token, user: { id: u.id, username: u.username, email: u.email, role: u.role, coins: u.coins, isBanned: u.is_banned, referralCode: u.referral_code, freeAppsUsed: u.free_apps_used } });
+  } catch (e) { console.error(e); res.status(500).json({ error: "Login failed" }); }
 });
 
-app.post("/api/brucepanel/auth/logout", (_req, res) => res.json({ message: "Logged out" }));
 app.get("/api/brucepanel/auth/me", auth, async (req, res) => {
-  const user = (await pool.query("SELECT * FROM bp_users WHERE id=$1", [req.userId])).rows[0];
-  if (!user) return res.status(401).json({ error: "Not found" });
-  res.json({ id: user.id, username: user.username, createdAt: user.created_at });
+  try {
+    const r = await pool.query(
+      "SELECT id, username, email, role, coins, is_banned, referral_code, free_apps_used FROM bp_users WHERE id=$1",
+      [req.userId]
+    );
+    if (!r.rows[0]) return res.status(404).json({ error: "User not found" });
+    const u = r.rows[0];
+    if (u.is_banned) return res.status(403).json({ error: "Account banned" });
+    res.json({ id: u.id, username: u.username, email: u.email, role: u.role, coins: u.coins, isBanned: u.is_banned, referralCode: u.referral_code, freeAppsUsed: u.free_apps_used });
+  } catch (e) { res.status(500).json({ error: "Failed" }); }
 });
 
-// Projects CRUD
+// ─── Notification routes ──────────────────────────────────────────────────
+
+app.get("/api/brucepanel/notifications", auth, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT * FROM bp_notifications WHERE user_id=$1 OR user_id IS NULL ORDER BY created_at DESC LIMIT 50`,
+      [req.userId]
+    );
+    res.json({ notifications: r.rows.map(n => ({ ...n, isRead: n.read })) });
+  } catch (e) { res.status(500).json({ error: "Failed" }); }
+});
+
+app.put("/api/brucepanel/notifications/:id/read", auth, async (req, res) => {
+  try {
+    await pool.query("UPDATE bp_notifications SET read=true WHERE id=$1", [req.params.id]);
+    res.json({ message: "Marked read" });
+  } catch (e) { res.status(500).json({ error: "Failed" }); }
+});
+
+// ─── Project routes ───────────────────────────────────────────────────────
+
 app.get("/api/brucepanel/projects", auth, async (req, res) => {
-  const rows = (await pool.query("SELECT * FROM bp_projects WHERE user_id=$1 ORDER BY created_at DESC", [req.userId])).rows;
-  res.json(rows.map(formatProject));
+  try {
+    const r = await pool.query(
+      "SELECT * FROM bp_projects WHERE user_id=$1 ORDER BY created_at DESC",
+      [req.userId]
+    );
+    const projects = r.rows.map(p => ({
+      ...p, startCommand: p.start_command, githubUrl: p.github_url,
+      isFreeSlot: p.is_free_slot, userId: p.user_id,
+      status: processes.has(p.id) ? "running" : p.status,
+    }));
+    res.json({ projects });
+  } catch (e) { res.status(500).json({ error: "Failed" }); }
 });
 
 app.post("/api/brucepanel/projects", auth, async (req, res) => {
-  const { name, description, startCommand, githubUrl, autoUpdate } = req.body;
-  if (!name || !startCommand) return res.status(400).json({ error: "name and startCommand required" });
-  const id = uuidv4();
-  const project = (await pool.query("INSERT INTO bp_projects(id,user_id,name,description,start_command,github_url,auto_update) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *", [id, req.userId, name, description||"", startCommand, githubUrl||"", autoUpdate||false])).rows[0];
-  fs.mkdirSync(path.join(PROJECTS_DIR, id), { recursive: true });
-  if (githubUrl) deployFromGitHub(id, githubUrl, startCommand, {}, true);
-  res.json(formatProject(project));
+  try {
+    const { name, description = "", startCommand = "npm start", githubUrl = "", env = {} } = req.body;
+    if (!name) return res.status(400).json({ error: "Project name required" });
+
+    const userR = await pool.query("SELECT coins, free_apps_used FROM bp_users WHERE id=$1", [req.userId]);
+    const user = userR.rows[0];
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    const FREE_LIMIT = 2;
+    const COST = 50;
+    let isFreeSlot = false;
+
+    if (user.free_apps_used < FREE_LIMIT) {
+      isFreeSlot = true;
+      await pool.query("UPDATE bp_users SET free_apps_used=free_apps_used+1 WHERE id=$1", [req.userId]);
+    } else {
+      if (user.coins < COST) return res.status(402).json({ error: "INSUFFICIENT_COINS", required: COST, current: user.coins });
+      await pool.query("UPDATE bp_users SET coins=coins-$1 WHERE id=$2", [COST, req.userId]);
+    }
+
+    const id = uuidv4();
+    await pool.query(
+      `INSERT INTO bp_projects (id, user_id, name, description, start_command, github_url, env, is_free_slot, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'idle')`,
+      [id, req.userId, name, description, startCommand, githubUrl, JSON.stringify(env), isFreeSlot]
+    );
+    res.json({ project: { id, name, description, startCommand, githubUrl, env, isFreeSlot, status: "idle" } });
+  } catch (e) { console.error(e); res.status(500).json({ error: "Failed to create project" }); }
 });
 
 app.get("/api/brucepanel/projects/:id", auth, async (req, res) => {
-  const project = (await pool.query("SELECT * FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId])).rows[0];
-  if (!project) return res.status(404).json({ error: "Not found" });
-  res.json(formatProject(project));
+  try {
+    const r = await pool.query("SELECT * FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId]);
+    if (!r.rows[0]) return res.status(404).json({ error: "Not found" });
+    const p = r.rows[0];
+    res.json({ ...p, startCommand: p.start_command, githubUrl: p.github_url, isFreeSlot: p.is_free_slot, status: processes.has(p.id) ? "running" : p.status });
+  } catch (e) { res.status(500).json({ error: "Failed" }); }
 });
 
 app.delete("/api/brucepanel/projects/:id", auth, async (req, res) => {
-  const project = (await pool.query("SELECT * FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId])).rows[0];
-  if (!project) return res.status(404).json({ error: "Not found" });
-  await stopProcess(project.id);
-  const dir = path.join(PROJECTS_DIR, project.id);
-  if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
-  await pool.query("DELETE FROM bp_projects WHERE id=$1", [project.id]);
-  res.json({ message: "Deleted" });
+  try {
+    const r = await pool.query("SELECT id FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId]);
+    if (!r.rows[0]) return res.status(404).json({ error: "Not found" });
+    await stopProcess(req.params.id);
+    const dir = path.join(PROJECTS_DIR, req.params.id);
+    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+    await pool.query("DELETE FROM bp_projects WHERE id=$1", [req.params.id]);
+    res.json({ message: "Project deleted" });
+  } catch (e) { res.status(500).json({ error: "Failed" }); }
 });
 
-// Process actions
+// ─── Project control routes ───────────────────────────────────────────────
+
 app.post("/api/brucepanel/projects/:id/start", auth, async (req, res) => {
-  const p = (await pool.query("SELECT * FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId])).rows[0];
-  if (!p) return res.status(404).json({ error: "Not found" });
-  await startProcess(p.id, p.start_command, JSON.parse(p.env||"{}"));
-  res.json({ message: "Started" });
+  try {
+    const r = await pool.query("SELECT * FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId]);
+    const p = r.rows[0];
+    if (!p) return res.status(404).json({ error: "Not found" });
+
+    const dir = path.join(PROJECTS_DIR, req.params.id);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+    // Clone if github_url provided and no code yet
+    if (p.github_url && !fs.existsSync(path.join(dir, ".git"))) {
+      await pool.query("UPDATE bp_projects SET status='installing', updated_at=NOW() WHERE id=$1", [req.params.id]);
+      await new Promise((resolve, reject) => {
+        const git = spawn("git", ["clone", p.github_url, "."], { cwd: dir });
+        git.stdout.on("data", d => addLog(req.params.id, d.toString().trim()));
+        git.stderr.on("data", d => addLog(req.params.id, d.toString().trim()));
+        git.on("exit", code => code === 0 ? resolve() : reject(new Error("Clone failed")));
+      });
+      // npm install if package.json exists
+      if (fs.existsSync(path.join(dir, "package.json"))) {
+        await new Promise((resolve) => {
+          const npm = spawn("npm", ["install"], { cwd: dir });
+          npm.stdout.on("data", d => addLog(req.params.id, d.toString().trim()));
+          npm.stderr.on("data", d => addLog(req.params.id, d.toString().trim()));
+          npm.on("exit", resolve);
+        });
+      }
+    }
+
+    const envVars = JSON.parse(p.env || "{}");
+    await startProcess(req.params.id, dir, p.start_command, envVars);
+    await pool.query("UPDATE bp_projects SET status='running', updated_at=NOW() WHERE id=$1", [req.params.id]);
+    res.json({ message: "Started" });
+  } catch (e) {
+    await pool.query("UPDATE bp_projects SET status='error', updated_at=NOW() WHERE id=$1", [req.params.id]);
+    res.status(500).json({ error: e.message || "Failed to start" });
+  }
 });
 
 app.post("/api/brucepanel/projects/:id/stop", auth, async (req, res) => {
-  const p = (await pool.query("SELECT * FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId])).rows[0];
-  if (!p) return res.status(404).json({ error: "Not found" });
-  addLog(p.id, "⏹ Stop requested");
-  await stopProcess(p.id);
-  await pool.query("UPDATE bp_projects SET status='stopped', updated_at=NOW() WHERE id=$1", [p.id]);
-  res.json({ message: "Stopped" });
+  try {
+    const r = await pool.query("SELECT id FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId]);
+    if (!r.rows[0]) return res.status(404).json({ error: "Not found" });
+    await stopProcess(req.params.id);
+    await pool.query("UPDATE bp_projects SET status='stopped', updated_at=NOW() WHERE id=$1", [req.params.id]);
+    res.json({ message: "Stopped" });
+  } catch (e) { res.status(500).json({ error: "Failed" }); }
 });
 
-app.post("/api/brucepanel/projects/:id/restart", auth, async (req, res) => {
-  const p = (await pool.query("SELECT * FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId])).rows[0];
-  if (!p) return res.status(404).json({ error: "Not found" });
-  addLog(p.id, "↺ Restart requested");
-  await stopProcess(p.id);
-  await startProcess(p.id, p.start_command, JSON.parse(p.env||"{}"));
-  res.json({ message: "Restarted" });
-});
-
-app.post("/api/brucepanel/projects/:id/reinstall", auth, async (req, res) => {
-  const p = (await pool.query("SELECT * FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId])).rows[0];
-  if (!p) return res.status(404).json({ error: "Not found" });
-  await stopProcess(p.id);
-  const dir = path.join(PROJECTS_DIR, p.id);
-  const nm = path.join(dir, "node_modules");
-  if (fs.existsSync(nm)) { addLog(p.id, "🗑 Removing node_modules..."); fs.rmSync(nm, { recursive: true, force: true }); }
-  runInstall(p.id, dir, JSON.parse(p.env||"{}"), false);
-  res.json({ message: "Reinstalling dependencies" });
-});
-
-app.post("/api/brucepanel/projects/:id/deploy", auth, async (req, res) => {
-  const p = (await pool.query("SELECT * FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId])).rows[0];
-  if (!p) return res.status(404).json({ error: "Not found" });
-  const url = req.body.githubUrl || p.github_url;
-  if (!url) return res.status(400).json({ error: "No GitHub URL" });
-  deployFromGitHub(p.id, url, p.start_command, JSON.parse(p.env||"{}"), req.body.updateDeps !== false);
-  res.json({ message: "Deploy started" });
-});
-
-// npm update (within version ranges)
-app.post("/api/brucepanel/projects/:id/update-deps", auth, async (req, res) => {
-  const p = (await pool.query("SELECT * FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId])).rows[0];
-  if (!p) return res.status(404).json({ error: "Not found" });
-  const dir = path.join(PROJECTS_DIR, p.id);
-  if (!fs.existsSync(path.join(dir, "package.json"))) return res.status(400).json({ error: "No package.json found" });
-  await stopProcess(p.id);
-  runDepsCommand(p.id, dir, JSON.parse(p.env||"{}"), "npm update", "npm update (within version ranges)");
-  res.json({ message: "Update started — check logs" });
-});
-
-// npm-check-updates + npm install (upgrade to latest)
-app.post("/api/brucepanel/projects/:id/upgrade-deps", auth, async (req, res) => {
-  const p = (await pool.query("SELECT * FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId])).rows[0];
-  if (!p) return res.status(404).json({ error: "Not found" });
-  const dir = path.join(PROJECTS_DIR, p.id);
-  if (!fs.existsSync(path.join(dir, "package.json"))) return res.status(400).json({ error: "No package.json found" });
-  await stopProcess(p.id);
-  runDepsCommand(p.id, dir, JSON.parse(p.env||"{}"), "npx --yes npm-check-updates -u && npm install", "Upgrading all dependencies to latest");
-  res.json({ message: "Upgrade started — check logs" });
-});
-
-// git pull + reinstall
-app.post("/api/brucepanel/projects/:id/pull", auth, async (req, res) => {
-  const p = (await pool.query("SELECT * FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId])).rows[0];
-  if (!p) return res.status(404).json({ error: "Not found" });
-  const dir = path.join(PROJECTS_DIR, p.id);
-  if (!fs.existsSync(path.join(dir, ".git"))) return res.status(400).json({ error: "No .git directory — deploy from GitHub first" });
-  await stopProcess(p.id);
-  pool.query("UPDATE bp_projects SET status='installing', updated_at=NOW() WHERE id=$1", [p.id]).catch(() => {});
-  if (!processes.has(p.id)) processes.set(p.id, { proc: null, logs: [], startedAt: null });
-  addLog(p.id, "⬆️ Pulling latest from GitHub...");
-  const pull = spawn("git", ["pull"], { cwd: dir, env: process.env, shell: true });
-  pull.stdout?.on("data", d => d.toString().split("\n").filter(Boolean).forEach(l => addLog(p.id, l)));
-  pull.stderr?.on("data", d => d.toString().split("\n").filter(Boolean).forEach(l => addLog(p.id, l)));
-  pull.on("exit", code => {
-    if (code !== 0) { addLog(p.id, `❌ git pull failed`); pool.query("UPDATE bp_projects SET status='error', updated_at=NOW() WHERE id=$1", [p.id]).catch(() => {}); return; }
-    addLog(p.id, "✅ Pull complete");
-    if (req.body?.reinstall !== false && fs.existsSync(path.join(dir, "package.json")))
-      runInstall(p.id, dir, JSON.parse(p.env||"{}"), true, p.start_command);
-    else startProcess(p.id, p.start_command, JSON.parse(p.env||"{}"));
-  });
-  res.json({ message: "Pull started — check logs" });
-});
-
-// ─── Logs routes ──────────────────────────────────────────────────
 app.get("/api/brucepanel/projects/:id/logs", auth, async (req, res) => {
-  const p = (await pool.query("SELECT id FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId])).rows[0];
-  if (!p) return res.status(404).json({ error: "Not found" });
-  const lines = parseInt(req.query.lines) || 200;
-  const fileLogs = readLogsFromFile(req.params.id, lines);
-  const memLogs = processes.get(req.params.id)?.logs || [];
-  const all = fileLogs.length > 0 ? fileLogs : memLogs;
-  res.json({ logs: all.length > 0 ? all : ["No logs yet — start or deploy the project."] });
+  try {
+    const r = await pool.query("SELECT id FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId]);
+    if (!r.rows[0]) return res.status(404).json({ error: "Not found" });
+    const entry = processes.get(req.params.id);
+    const live = entry?.logs || [];
+    const file = readLogs(req.params.id, 200);
+    const all = [...new Set([...file, ...live])].slice(-200);
+    res.json({ logs: all });
+  } catch (e) { res.status(500).json({ error: "Failed" }); }
 });
 
-app.delete("/api/brucepanel/projects/:id/logs", auth, async (req, res) => {
-  const p = (await pool.query("SELECT id FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId])).rows[0];
-  if (!p) return res.status(404).json({ error: "Not found" });
-  const file = logFilePath(req.params.id);
-  if (fs.existsSync(file)) fs.writeFileSync(file, "");
-  const entry = processes.get(req.params.id);
-  if (entry) entry.logs = [];
-  res.json({ message: "Logs cleared" });
-});
-
-// SSE live log stream
-app.get("/api/brucepanel/projects/:id/logs/stream", auth, async (req, res) => {
-  const p = (await pool.query("SELECT id FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId])).rows[0];
-  if (!p) { res.status(404).end(); return; }
+app.get("/api/brucepanel/projects/:id/stream", auth, async (req, res) => {
+  const r = await pool.query("SELECT id FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId]);
+  if (!r.rows[0]) return res.status(404).end();
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
-  res.setHeader("X-Accel-Buffering", "no");
-  res.flushHeaders();
-  const recent = readLogsFromFile(req.params.id, 50);
-  res.write(`data: ${JSON.stringify({ history: recent })}\n\n`);
   if (!sseClients.has(req.params.id)) sseClients.set(req.params.id, new Set());
   sseClients.get(req.params.id).add(res);
-  const hb = setInterval(() => { try { res.write(": ping\n\n"); } catch {} }, 15000);
+  const hb = setInterval(() => { try { res.write(":heartbeat\n\n"); } catch {} }, 15000);
   req.on("close", () => { clearInterval(hb); sseClients.get(req.params.id)?.delete(res); });
 });
 
-// ─── Env routes ───────────────────────────────────────────────────
 app.get("/api/brucepanel/projects/:id/env", auth, async (req, res) => {
-  const p = (await pool.query("SELECT env FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId])).rows[0];
-  if (!p) return res.status(404).json({ error: "Not found" });
-  res.json({ env: JSON.parse(p.env || "{}") });
+  const r = await pool.query("SELECT env FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId]);
+  if (!r.rows[0]) return res.status(404).json({ error: "Not found" });
+  res.json({ env: JSON.parse(r.rows[0].env || "{}") });
 });
 
 app.put("/api/brucepanel/projects/:id/env", auth, async (req, res) => {
-  const p = (await pool.query("SELECT id FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId])).rows[0];
-  if (!p) return res.status(404).json({ error: "Not found" });
-  await pool.query("UPDATE bp_projects SET env=$1, updated_at=NOW() WHERE id=$2", [JSON.stringify(req.body.env||{}), req.params.id]);
+  const r = await pool.query("SELECT id FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId]);
+  if (!r.rows[0]) return res.status(404).json({ error: "Not found" });
+  await pool.query("UPDATE bp_projects SET env=$1, updated_at=NOW() WHERE id=$2", [JSON.stringify(req.body.env || {}), req.params.id]);
   res.json({ message: "Updated" });
 });
 
-// ─── Static client ────────────────────────────────────────────────
+// ─── Subscribe routes ─────────────────────────────────────────────────────
+
+app.get("/api/brucepanel/subscribe/plans", (req, res) => {
+  res.json({ plans: PLANS });
+});
+
+app.post("/api/brucepanel/subscribe/initiate", auth, async (req, res) => {
+  try {
+    const { planId, phone } = req.body;
+    const plan = PLANS.find(p => p.id === planId);
+    if (!plan) return res.status(400).json({ error: "Invalid plan" });
+    if (!phone) return res.status(400).json({ error: "Phone number required" });
+
+    const txId = uuidv4();
+    await pool.query(
+      `INSERT INTO bp_transactions (id, user_id, plan, amount, coins, status, phone_number) VALUES ($1,$2,$3,$4,$5,'pending',$6)`,
+      [txId, req.userId, planId, plan.price, plan.coins, phone]
+    );
+
+    const payload = {
+      amount: plan.price,
+      phone_number: phone,
+      channel_id: PAYHERO_CHANNEL,
+      payment_service: "M-PESA",
+      provider: "m-pesa",
+      external_reference: txId,
+      callback_url: process.env.RENDER_EXTERNAL_URL
+        ? `${process.env.RENDER_EXTERNAL_URL}/api/brucepanel/subscribe/callback`
+        : "https://brucepanel.beratech.co.ke/api/brucepanel/subscribe/callback",
+    };
+
+    const phRes = await fetch(`${PAYHERO_BASE}/payments`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": PAYHERO_AUTH },
+      body: JSON.stringify(payload),
+    });
+    const phData = await phRes.json();
+    if (!phRes.ok) return res.status(500).json({ error: phData.message || "Payment initiation failed" });
+
+    const checkoutId = phData.CheckoutRequestID || phData.checkout_request_id || "";
+    await pool.query("UPDATE bp_transactions SET checkout_request_id=$1 WHERE id=$2", [checkoutId, txId]);
+
+    res.json({ message: "STK push sent. Enter M-Pesa PIN.", txId, checkoutRequestId: checkoutId });
+  } catch (e) { console.error(e); res.status(500).json({ error: "Failed to initiate payment" }); }
+});
+
+app.get("/api/brucepanel/subscribe/status/:checkoutRequestId", auth, async (req, res) => {
+  try {
+    const tx = await pool.query(
+      "SELECT * FROM bp_transactions WHERE checkout_request_id=$1 AND user_id=$2",
+      [req.params.checkoutRequestId, req.userId]
+    );
+    if (!tx.rows[0]) return res.status(404).json({ error: "Transaction not found" });
+    const t = tx.rows[0];
+    if (t.status === "success") return res.json({ status: "success", coins: t.coins });
+    if (t.status === "failed") return res.json({ status: "failed" });
+
+    // Poll PayHero
+    const phRes = await fetch(`${PAYHERO_BASE}/transaction-status?reference=${t.checkout_request_id}`, {
+      headers: { "Authorization": PAYHERO_AUTH },
+    });
+    if (phRes.ok) {
+      const phData = await phRes.json();
+      const s = phData.status?.toLowerCase() || phData.Status?.toLowerCase() || "";
+      if (s === "success" || s === "completed") {
+        await pool.query("UPDATE bp_transactions SET status='success', payment_ref=$1 WHERE id=$2", [phData.MpesaReceiptNumber || "", t.id]);
+        await pool.query("UPDATE bp_users SET coins=coins+$1 WHERE id=$2", [t.coins, req.userId]);
+        await notify(req.userId, "Payment Successful! 🎉", `You received ${t.coins} BB Coins for the ${t.plan} plan.`, "success");
+        return res.json({ status: "success", coins: t.coins });
+      } else if (s === "failed" || s === "cancelled") {
+        await pool.query("UPDATE bp_transactions SET status='failed' WHERE id=$1", [t.id]);
+        return res.json({ status: "failed" });
+      }
+    }
+    res.json({ status: "pending" });
+  } catch (e) { res.status(500).json({ error: "Status check failed" }); }
+});
+
+app.post("/api/brucepanel/subscribe/callback", async (req, res) => {
+  try {
+    const body = req.body;
+    const checkoutId = body.CheckoutRequestID || body.checkout_request_id;
+    const status = (body.ResultCode === 0 || body.status === "success") ? "success" : "failed";
+    if (checkoutId) {
+      const tx = await pool.query("SELECT * FROM bp_transactions WHERE checkout_request_id=$1", [checkoutId]);
+      if (tx.rows[0] && tx.rows[0].status === "pending") {
+        await pool.query("UPDATE bp_transactions SET status=$1 WHERE id=$2", [status, tx.rows[0].id]);
+        if (status === "success") {
+          await pool.query("UPDATE bp_users SET coins=coins+$1 WHERE id=$2", [tx.rows[0].coins, tx.rows[0].user_id]);
+          await notify(tx.rows[0].user_id, "Payment Successful! 🎉", `You received ${tx.rows[0].coins} BB Coins.`, "success");
+        }
+      }
+    }
+    res.json({ message: "OK" });
+  } catch { res.json({ message: "OK" }); }
+});
+
+// ─── Referral routes ──────────────────────────────────────────────────────
+
+app.get("/api/brucepanel/referral/info", auth, async (req, res) => {
+  try {
+    const u = await pool.query("SELECT referral_code, coins FROM bp_users WHERE id=$1", [req.userId]);
+    if (!u.rows[0]) return res.status(404).json({ error: "Not found" });
+    const refs = await pool.query(
+      `SELECT r.*, u.username FROM bp_referrals r JOIN bp_users u ON u.id=r.referee_id WHERE r.referrer_id=$1 ORDER BY r.created_at DESC`,
+      [req.userId]
+    );
+    res.json({
+      referralCode: u.rows[0].referral_code,
+      coins: u.rows[0].coins,
+      totalReferrals: refs.rows.length,
+      totalCoinsEarned: refs.rows.reduce((s, r) => s + r.coins_awarded, 0),
+      referrals: refs.rows.map(r => ({ username: r.username, coinsAwarded: r.coins_awarded, createdAt: r.created_at })),
+    });
+  } catch (e) { res.status(500).json({ error: "Failed" }); }
+});
+
+// ─── Admin routes ─────────────────────────────────────────────────────────
+
+app.get("/api/brucepanel/admin/stats", auth, adminOnly, async (req, res) => {
+  try {
+    const [users, projects, runningR, payments, pending, banned, refs, coins, revenue] = await Promise.all([
+      pool.query("SELECT COUNT(*) FROM bp_users"),
+      pool.query("SELECT COUNT(*) FROM bp_projects"),
+      pool.query("SELECT COUNT(*) FROM bp_projects WHERE status='running'"),
+      pool.query("SELECT COUNT(*) FROM bp_transactions WHERE status='success'"),
+      pool.query("SELECT COUNT(*) FROM bp_transactions WHERE status='pending'"),
+      pool.query("SELECT COUNT(*) FROM bp_users WHERE is_banned=true"),
+      pool.query("SELECT COUNT(*) FROM bp_referrals"),
+      pool.query("SELECT COALESCE(SUM(coins),0) FROM bp_users"),
+      pool.query("SELECT plan, COALESCE(SUM(amount),0) as total FROM bp_transactions WHERE status='success' GROUP BY plan"),
+    ]);
+    const planBreakdown = {};
+    revenue.rows.forEach(r => { planBreakdown[r.plan] = parseInt(r.total); });
+    const totalRevenue = Object.values(planBreakdown).reduce((s, v) => s + v, 0);
+    res.json({
+      users: parseInt(users.rows[0].count),
+      projects: parseInt(projects.rows[0].count),
+      runningProjects: parseInt(runningR.rows[0].count),
+      successfulPayments: parseInt(payments.rows[0].count),
+      pendingPayments: parseInt(pending.rows[0].count),
+      bannedUsers: parseInt(banned.rows[0].count),
+      totalReferrals: parseInt(refs.rows[0].count),
+      totalCoinsInCirculation: parseInt(coins.rows[0].coalesce),
+      totalRevenue, planBreakdown,
+    });
+  } catch (e) { res.status(500).json({ error: "Failed" }); }
+});
+
+app.get("/api/brucepanel/admin/users", auth, adminOnly, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT id,username,email,role,coins,is_banned,referral_code,free_apps_used,created_at FROM bp_users ORDER BY created_at DESC");
+    res.json({ users: r.rows.map(u => ({ ...u, isBanned: u.is_banned, referralCode: u.referral_code, freeAppsUsed: u.free_apps_used })) });
+  } catch (e) { res.status(500).json({ error: "Failed" }); }
+});
+
+app.post("/api/brucepanel/admin/users/:id/coins", auth, adminOnly, async (req, res) => {
+  try {
+    const { amount, reason = "" } = req.body;
+    await pool.query("UPDATE bp_users SET coins=coins+$1 WHERE id=$2", [amount, req.params.id]);
+    const u = await pool.query("SELECT username FROM bp_users WHERE id=$1", [req.params.id]);
+    if (amount > 0) await notify(req.params.id, `+${amount} BB Coins`, reason || `An admin added ${amount} coins to your account.`, "success");
+    else await notify(req.params.id, `${amount} BB Coins`, reason || `An admin adjusted your coins by ${amount}.`, "warning");
+    res.json({ message: "Coins updated" });
+  } catch (e) { res.status(500).json({ error: "Failed" }); }
+});
+
+app.post("/api/brucepanel/admin/users/:id/ban", auth, adminOnly, async (req, res) => {
+  try {
+    const { banned } = req.body;
+    await pool.query("UPDATE bp_users SET is_banned=$1 WHERE id=$2", [!!banned, req.params.id]);
+    if (banned) await notify(req.params.id, "Account Banned", "Your account has been banned. Contact support.", "danger");
+    else await notify(req.params.id, "Account Unbanned", "Your account has been reinstated.", "success");
+    res.json({ message: banned ? "User banned" : "User unbanned" });
+  } catch (e) { res.status(500).json({ error: "Failed" }); }
+});
+
+app.post("/api/brucepanel/admin/users/:id/role", auth, adminOnly, async (req, res) => {
+  try {
+    if (req.userRole !== "admin") return res.status(403).json({ error: "Super admin only" });
+    const { role } = req.body;
+    if (!["user","moderator","admin"].includes(role)) return res.status(400).json({ error: "Invalid role" });
+    await pool.query("UPDATE bp_users SET role=$1 WHERE id=$2", [role, req.params.id]);
+    res.json({ message: "Role updated" });
+  } catch (e) { res.status(500).json({ error: "Failed" }); }
+});
+
+app.post("/api/brucepanel/admin/users/:id/email", auth, adminOnly, async (req, res) => {
+  try {
+    const { email } = req.body;
+    await pool.query("UPDATE bp_users SET email=$1 WHERE id=$2", [email, req.params.id]);
+    res.json({ message: "Email updated" });
+  } catch (e) { res.status(500).json({ error: "Failed" }); }
+});
+
+app.delete("/api/brucepanel/admin/users/:id", auth, adminOnly, async (req, res) => {
+  try {
+    if (req.userRole !== "admin") return res.status(403).json({ error: "Super admin only" });
+    const u = await pool.query("SELECT username,role FROM bp_users WHERE id=$1", [req.params.id]);
+    if (!u.rows[0]) return res.status(404).json({ error: "User not found" });
+    if (u.rows[0].role === "admin") return res.status(403).json({ error: "Cannot delete admin" });
+    const projs = await pool.query("SELECT id FROM bp_projects WHERE user_id=$1", [req.params.id]);
+    for (const p of projs.rows) {
+      await stopProcess(p.id);
+      const dir = path.join(PROJECTS_DIR, p.id);
+      if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+    }
+    await pool.query("DELETE FROM bp_users WHERE id=$1", [req.params.id]);
+    res.json({ message: `User ${u.rows[0].username} deleted` });
+  } catch (e) { res.status(500).json({ error: "Failed" }); }
+});
+
+app.get("/api/brucepanel/admin/projects", auth, adminOnly, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT p.*, u.username FROM bp_projects p JOIN bp_users u ON u.id=p.user_id ORDER BY p.created_at DESC`
+    );
+    res.json({ projects: r.rows.map(p => ({ ...p, startCommand: p.start_command, githubUrl: p.github_url, isFreeSlot: p.is_free_slot, userId: p.user_id, status: processes.has(p.id) ? "running" : p.status })), total: r.rows.length });
+  } catch (e) { res.status(500).json({ error: "Failed" }); }
+});
+
+app.delete("/api/brucepanel/admin/projects/:id", auth, adminOnly, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT id,name FROM bp_projects WHERE id=$1", [req.params.id]);
+    if (!r.rows[0]) return res.status(404).json({ error: "Not found" });
+    await stopProcess(req.params.id);
+    const dir = path.join(PROJECTS_DIR, req.params.id);
+    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+    await pool.query("DELETE FROM bp_projects WHERE id=$1", [req.params.id]);
+    res.json({ message: `Project "${r.rows[0].name}" deleted` });
+  } catch (e) { res.status(500).json({ error: "Failed" }); }
+});
+
+app.get("/api/brucepanel/admin/transactions", auth, adminOnly, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT t.*, u.username FROM bp_transactions t JOIN bp_users u ON u.id=t.user_id ORDER BY t.created_at DESC LIMIT 200`
+    );
+    res.json({ transactions: r.rows.map(t => ({ ...t, phoneNumber: t.phone_number, paymentRef: t.payment_ref })) });
+  } catch (e) { res.status(500).json({ error: "Failed" }); }
+});
+
+app.post("/api/brucepanel/admin/notifications", auth, adminOnly, async (req, res) => {
+  try {
+    const { title, message, type = "info", userId } = req.body;
+    if (!title || !message) return res.status(400).json({ error: "Title and message required" });
+    if (userId) {
+      await notify(userId, title, message, type);
+      res.json({ message: "Notification sent" });
+    } else {
+      await pool.query(
+        "INSERT INTO bp_notifications (id, user_id, title, message, type) VALUES ($1, NULL, $2, $3, $4)",
+        [uuidv4(), title, message, type]
+      );
+      res.json({ message: `Broadcast sent to all users` });
+    }
+  } catch (e) { res.status(500).json({ error: "Failed" }); }
+});
+
+app.post("/api/brucepanel/admin/notifications/purge", auth, adminOnly, async (req, res) => {
+  try {
+    const { olderThanDays = 30 } = req.body;
+    const r = await pool.query(
+      "DELETE FROM bp_notifications WHERE read=true AND created_at < NOW() - INTERVAL '$1 days'",
+      [olderThanDays]
+    );
+    res.json({ message: `Purged old notifications`, deleted: r.rowCount });
+  } catch (e) { res.status(500).json({ error: "Failed" }); }
+});
+
+app.post("/api/brucepanel/admin/bulk/coins", auth, adminOnly, async (req, res) => {
+  try {
+    const { amount, reason = "", excludeAdmin = true } = req.body;
+    if (!amount || amount <= 0) return res.status(400).json({ error: "Amount must be positive" });
+    let query = "UPDATE bp_users SET coins=coins+$1";
+    const params = [amount];
+    if (excludeAdmin) { query += " WHERE role='user'"; }
+    await pool.query(query, params);
+    await pool.query(
+      "INSERT INTO bp_notifications (id, user_id, title, message, type) VALUES ($1, NULL, $2, $3, $4)",
+      [uuidv4(), `🪙 ${amount} BB Coins Airdrop!`, reason || `You received ${amount} free BB Coins from Bera Tech!`, "success"]
+    );
+    res.json({ message: `Airdropped ${amount} coins to ${excludeAdmin ? "all regular users" : "everyone"}` });
+  } catch (e) { res.status(500).json({ error: "Failed" }); }
+});
+
+// ─── Static client ────────────────────────────────────────────────────────
 const clientDist = path.join(__dirname, "client", "dist");
 if (fs.existsSync(clientDist)) {
   app.use(express.static(clientDist));
   app.get("*", (_req, res) => res.sendFile(path.join(clientDist, "index.html")));
 } else {
-  app.get("/", (_req, res) => res.send("<h2>BrucePanel API running. Build client: cd client && npm install && npm run build</h2>"));
+  app.get("/", (_req, res) => res.send("<h2>BrucePanel API is running! Build the client: cd client && npm install && npm run build</h2>"));
 }
 
-initDB().then(() => app.listen(PORT, () => console.log(`🚀 BrucePanel running on port ${PORT}`))).catch(e => { console.error("DB init failed:", e.message); process.exit(1); });
+// ─── Start ────────────────────────────────────────────────────────────────
+initDB()
+  .then(() => app.listen(PORT, () => console.log(`🚀 BrucePanel running on port ${PORT}`)))
+  .catch(e => { console.error("DB init failed:", e.message || e); process.exit(1); });
