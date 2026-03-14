@@ -62,6 +62,8 @@ export default function ProjectDetail() {
   const [fileContent, setFileContent] = useState("");
   const [fileSaving, setFileSaving] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [autoRestart, setAutoRestart] = useState(false);
+  const [savingSettings, setSavingSettings] = useState(false);
   const [uploadProgress, setUploadProgress] = useState("");
   const fileInputRef = useRef(null);
 
@@ -74,7 +76,7 @@ export default function ProjectDetail() {
   }, [id]);
 
   useEffect(() => { load(); loadLogs(); }, [id]);
-  useEffect(() => { if (project) setSettings({ name: project.name, description: project.description || "", startCommand: project.startCommand, githubUrl: project.githubUrl || "" }); }, [project]);
+  useEffect(() => { if (project) { setAutoRestart(!!project.auto_restart); setSettings({ name: project.name, description: project.description || "", startCommand: project.startCommand, githubUrl: project.githubUrl || "" }); } }, [project]);
   useEffect(() => { if (live) { const t = setInterval(() => { load(); loadLogs(); }, 3000); return () => clearInterval(t); } }, [live]);
   useEffect(() => { if (tab === "env") api.getEnv(id).then(r => { setEnv(r.env); setEnvRows(Object.entries(r.env).length ? Object.entries(r.env) : [["", ""]]); }).catch(() => {}); }, [tab]);
   useEffect(() => { if (tab === "files") loadFiles(); }, [tab]);
@@ -84,6 +86,18 @@ export default function ProjectDetail() {
   async function action(fn, label) { setMsg(""); try { await fn(id); flash(`✅ ${label}`); load(); loadLogs(); } catch (e) { flash(`❌ ${e.message}`); } }
   async function saveEnv(e) { e.preventDefault(); setS(true); try { const obj = Object.fromEntries(envRows.filter(([k]) => k)); await api.updateEnv(id, obj); flash("✅ Environment saved"); } catch (e) { flash(`❌ ${e.message}`); } finally { setS(false); } }
   async function deploy(e) { e.preventDefault(); setD(true); setMsg(""); try { await api.deployProject(id, { githubUrl: settings.githubUrl }); flash("✅ Deploy started"); load(); loadLogs(); } catch (e) { flash(`❌ ${e.message}`); } finally { setD(false); } }
+
+  async function saveSettings() {
+    setSavingSettings(true);
+    try {
+      await api.updateProjectSettings(id, {
+        name: settings.name, description: settings.description,
+        startCommand: settings.startCommand, githubUrl: settings.githubUrl, autoRestart
+      });
+      flash("✅ Settings saved"); await load();
+    } catch (e) { flash("❌ " + e.message); }
+    setSavingSettings(false);
+  }
 
   async function openFile(node) {
     setSelectedFile(node);
@@ -156,6 +170,9 @@ export default function ProjectDetail() {
             <button onClick={() => action(api.stopProject, "Stopped")} className="bg-red-600 hover:bg-red-500 text-white px-4 py-2 rounded-lg text-sm font-medium transition">■ Stop</button>
           )}
           <button onClick={() => { load(); loadLogs(); }} className="bg-[#1a1a24] hover:bg-[#22222f] border border-[#2d2d3e] text-slate-300 px-4 py-2 rounded-lg text-sm transition">↻ Refresh</button>
+          <a href={api.backupProject(id)} download className="bg-[#1a1a24] hover:bg-[#22222f] border border-[#2d2d3e] text-slate-300 px-4 py-2 rounded-lg text-sm transition flex items-center gap-1">
+            ⬇ Backup
+          </a>
           <button onClick={() => setLive(l => !l)} className={`px-4 py-2 rounded-lg text-sm border transition ${live ? "bg-blue-600/20 border-blue-500 text-blue-400" : "bg-[#1a1a24] border-[#2d2d3e] text-slate-400 hover:text-white"}`}>
             {live ? "● Live" : "○ Live"}
           </button>
@@ -293,24 +310,51 @@ export default function ProjectDetail() {
         {/* Settings */}
         {tab === "settings" && (
           <div className="space-y-6">
-            <form onSubmit={deploy} className="bg-[#111118] border border-[#2d2d3e] rounded-xl p-6 space-y-4">
-              <h3 className="text-white font-medium">Deploy from GitHub</h3>
-              <p className="text-slate-500 text-xs">Paste a GitHub repo URL to clone and run. Or use the Files tab to upload a ZIP directly.</p>
-              <div>
-                <label className="text-slate-400 text-sm block mb-1">GitHub URL</label>
-                <input value={settings.githubUrl || ""} onChange={e => setSettings(s => ({ ...s, githubUrl: e.target.value }))}
-                  placeholder="https://github.com/user/repo"
-                  className="w-full bg-[#1a1a24] border border-[#2d2d3e] rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-blue-500 transition" />
+            <div className="space-y-4">
+              {/* Project settings */}
+              <div className="bg-[#111118] border border-[#2d2d3e] rounded-xl p-6 space-y-4">
+                <h3 className="text-white font-medium">Project Settings</h3>
+                <div className="grid sm:grid-cols-2 gap-4">
+                  <div>
+                    <label className="text-slate-400 text-sm block mb-1">Project Name</label>
+                    <input value={settings.name||""} onChange={e=>setSettings(s=>({...s,name:e.target.value}))}
+                      className="w-full bg-[#1a1a24] border border-[#2d2d3e] rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-blue-500" />
+                  </div>
+                  <div>
+                    <label className="text-slate-400 text-sm block mb-1">Start Command</label>
+                    <input value={settings.startCommand||""} onChange={e=>setSettings(s=>({...s,startCommand:e.target.value}))}
+                      className="w-full bg-[#1a1a24] border border-[#2d2d3e] rounded-lg px-4 py-2.5 text-white font-mono focus:outline-none focus:border-blue-500" />
+                  </div>
+                  <div className="sm:col-span-2">
+                    <label className="text-slate-400 text-sm block mb-1">GitHub URL</label>
+                    <input value={settings.githubUrl||""} onChange={e=>setSettings(s=>({...s,githubUrl:e.target.value}))}
+                      placeholder="https://github.com/user/repo"
+                      className="w-full bg-[#1a1a24] border border-[#2d2d3e] rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-blue-500" />
+                  </div>
+                </div>
+                {/* Auto-restart toggle */}
+                <div className="flex items-center justify-between p-4 bg-[#1a1a24] border border-[#2d2d3e] rounded-lg">
+                  <div>
+                    <div className="text-white text-sm font-medium">Auto-Restart on Crash</div>
+                    <div className="text-slate-500 text-xs mt-0.5">Automatically restart your project if it crashes (non-zero exit code)</div>
+                  </div>
+                  <button type="button" onClick={() => setAutoRestart(v => !v)}
+                    className={`relative w-12 h-6 rounded-full transition-colors ${autoRestart ? "bg-green-600" : "bg-[#2d2d3e]"}`}>
+                    <span className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white transition-transform ${autoRestart ? "translate-x-6" : ""}`} />
+                  </button>
+                </div>
+                <div className="flex gap-3">
+                  <button type="button" onClick={saveSettings} disabled={savingSettings}
+                    className="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white px-6 py-2.5 rounded-lg text-sm font-medium transition">
+                    {savingSettings ? "Saving..." : "💾 Save Settings"}
+                  </button>
+                  <form onSubmit={deploy} className="flex gap-3">
+                    <button type="submit" disabled={deploying} className="bg-green-600 hover:bg-green-500 disabled:opacity-50 text-white px-6 py-2.5 rounded-lg text-sm font-medium transition">
+                      {deploying ? "Deploying..." : "🚀 Deploy from GitHub"}
+                    </button>
+                  </form>
+                </div>
               </div>
-              <div>
-                <label className="text-slate-400 text-sm block mb-1">Start Command</label>
-                <input value={settings.startCommand || ""} onChange={e => setSettings(s => ({ ...s, startCommand: e.target.value }))}
-                  className="w-full bg-[#1a1a24] border border-[#2d2d3e] rounded-lg px-4 py-2.5 text-white font-mono focus:outline-none focus:border-blue-500 transition" />
-              </div>
-              <button type="submit" disabled={deploying} className="bg-green-600 hover:bg-green-500 disabled:opacity-50 text-white px-6 py-2.5 rounded-lg text-sm font-medium transition">
-                {deploying ? "Deploying..." : "🚀 Deploy from GitHub"}
-              </button>
-            </form>
 
             <div className="bg-[#111118] border border-[#2d2d3e] rounded-xl p-6 space-y-3">
               <h3 className="text-white font-medium">Project Info</h3>
@@ -318,7 +362,9 @@ export default function ProjectDetail() {
                 <div><p className="text-slate-500 text-xs">ID</p><p className="text-slate-300 font-mono text-xs mt-0.5">{project.id}</p></div>
                 <div><p className="text-slate-500 text-xs">Status</p><p className={`mt-0.5 text-sm ${STATUS_TEXT[project.status]}`}>{project.status}</p></div>
                 <div><p className="text-slate-500 text-xs">Start Command</p><p className="text-slate-300 font-mono text-xs mt-0.5">{project.startCommand}</p></div>
-                <div><p className="text-slate-500 text-xs">Created</p><p className="text-slate-300 text-xs mt-0.5">{new Date(project.createdAt || project.created_at).toLocaleDateString()}</p></div>
+                <div><p className="text-slate-500 text-xs">Created</p><p className="text-slate-300 text-xs mt-0.5">{new Date(project.createdAt||project.created_at).toLocaleDateString()}</p></div>
+                <div><p className="text-slate-500 text-xs">Restarts</p><p className="text-slate-300 text-xs mt-0.5">{project.restart_count || 0}</p></div>
+                <div><p className="text-slate-500 text-xs">Auto-Restart</p><p className={`text-xs mt-0.5 ${project.auto_restart ? "text-green-400" : "text-slate-500"}`}>{project.auto_restart ? "Enabled" : "Disabled"}</p></div>
               </div>
             </div>
           </div>
