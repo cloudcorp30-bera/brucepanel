@@ -1,5 +1,4 @@
 import { useState, useEffect } from "react";
-import { Link } from "react-router-dom";
 import { api } from "../api";
 
 const ACTION_ICONS = { login:"🔑", password_change:"🔐", promo_redeem:"🎁", project_create:"📁", project_delete:"🗑️", default:"📋" };
@@ -60,10 +59,8 @@ export default function Account() {
 
   return (
     <div className="min-h-screen bg-[#0a0a0f]">
-      <div className="max-w-2xl mx-auto px-4 py-10">
-        <Link to="/" className="text-slate-400 hover:text-white text-sm transition mb-6 inline-block">← Dashboard</Link>
-
-        <div className="flex items-center gap-4 mb-8">
+      <div className="max-w-2xl mx-auto px-4 py-6">
+        <div className="flex items-center gap-4 mb-6">
           <div className="w-14 h-14 rounded-full bg-gradient-to-br from-blue-600 to-purple-600 flex items-center justify-center text-white font-bold text-xl">
             {user?.username?.[0]?.toUpperCase() || "?"}
           </div>
