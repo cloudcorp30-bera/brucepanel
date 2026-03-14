@@ -119,4 +119,18 @@ export const api = {
   adminAudit: (page = 1) => req("GET", `/admin/audit?page=${page}`),
   adminPlatform: () => req("GET", "/admin/platform"),
   adminSavePlatform: (settings) => req("PUT", "/admin/platform", { settings }),
+
+  // Advanced admin
+  adminAnalytics: () => req("GET", "/admin/analytics"),
+  adminLiveFeed: () => req("GET", "/admin/live-feed"),
+  adminSearchUsers: ({ q, role, banned, minCoins, maxCoins }) =>
+    req("GET", `/admin/users/search?q=${encodeURIComponent(q||"")}&role=${role||""}&banned=${banned||""}&minCoins=${minCoins||""}&maxCoins=${maxCoins||""}`),
+  adminBulkAction: (userIds, action, value, reason) =>
+    req("POST", "/admin/users/bulk-action", { userIds, action, value, reason }),
+  adminEmergencyStop: () => req("POST", "/admin/emergency/stop-all"),
+  adminEmergencyRestart: () => req("POST", "/admin/emergency/restart-all"),
+  adminEmergencyBroadcast: (title, message, type) =>
+    req("POST", "/admin/emergency/broadcast", { title, message, type }),
+  adminNotes: () => req("GET", "/admin/notes"),
+  adminSaveNotes: (notes) => req("PUT", "/admin/notes", { notes }),
 };
