@@ -1879,6 +1879,220 @@ app.put("/api/brucepanel/admin/notes", auth, adminOnly, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  SUPPORT CHAT SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── Init support tables ──────────────────────────────────────────────────
+async function initSupport() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bp_support_sessions (
+      id           VARCHAR(36) PRIMARY KEY,
+      user_id      INTEGER REFERENCES bp_users(id) ON DELETE CASCADE,
+      subject      TEXT NOT NULL DEFAULT 'Support Request',
+      status       VARCHAR(20) DEFAULT 'open',
+      unread_admin INTEGER DEFAULT 0,
+      unread_user  INTEGER DEFAULT 0,
+      last_message TEXT,
+      created_at   TIMESTAMPTZ DEFAULT NOW(),
+      updated_at   TIMESTAMPTZ DEFAULT NOW()
+    )`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bp_support_messages (
+      id         VARCHAR(36) PRIMARY KEY,
+      session_id VARCHAR(36) REFERENCES bp_support_sessions(id) ON DELETE CASCADE,
+      user_id    INTEGER,
+      is_admin   BOOLEAN DEFAULT FALSE,
+      message    TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_support_session_user ON bp_support_sessions(user_id)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_support_msg_session  ON bp_support_messages(session_id)`);
+}
+initSupport().catch(e => console.error("Support init error:", e.message));
+
+// ─── User: list my sessions ────────────────────────────────────────────────
+app.get("/api/brucepanel/support/sessions", auth, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT s.*, u.username FROM bp_support_sessions s
+       JOIN bp_users u ON u.id = s.user_id
+       WHERE s.user_id = $1 ORDER BY s.updated_at DESC`,
+      [req.userId]
+    );
+    res.json({ sessions: r.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── User: open a new session ──────────────────────────────────────────────
+app.post("/api/brucepanel/support/sessions", auth, async (req, res) => {
+  const { subject = "Support Request" } = req.body;
+  if (!subject.trim()) return res.status(400).json({ error: "Subject required" });
+  try {
+    // Limit open sessions per user
+    const open = await pool.query(
+      "SELECT COUNT(*) FROM bp_support_sessions WHERE user_id=$1 AND status='open'",
+      [req.userId]
+    );
+    if (parseInt(open.rows[0].count) >= 3)
+      return res.status(429).json({ error: "You already have 3 open support sessions. Please close one first." });
+    const id = uuidv4();
+    await pool.query(
+      "INSERT INTO bp_support_sessions (id,user_id,subject) VALUES ($1,$2,$3)",
+      [id, req.userId, subject.trim().slice(0, 200)]
+    );
+    // Auto-send welcome message from system
+    await pool.query(
+      "INSERT INTO bp_support_messages (id,session_id,is_admin,message) VALUES ($1,$2,true,$3)",
+      [uuidv4(), id, "👋 Hi! Thanks for reaching out. A support agent will respond soon. In the meantime, describe your issue in as much detail as possible."]
+    );
+    await pool.query("UPDATE bp_support_sessions SET unread_user=1, last_message='Welcome! A support agent will respond soon.' WHERE id=$1", [id]);
+    auditLog(req.userId, req.ip, "support_open", `session:${id} subject:"${subject}"`, req.ip);
+    res.json({ sessionId: id, message: "Session created" });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Get messages in a session ─────────────────────────────────────────────
+app.get("/api/brucepanel/support/sessions/:id", auth, async (req, res) => {
+  try {
+    const isAdm = req.userRole === "admin" || req.userRole === "moderator";
+    const sessionQ = isAdm
+      ? await pool.query("SELECT s.*, u.username, u.email FROM bp_support_sessions s JOIN bp_users u ON u.id=s.user_id WHERE s.id=$1", [req.params.id])
+      : await pool.query("SELECT s.*, u.username FROM bp_support_sessions s JOIN bp_users u ON u.id=s.user_id WHERE s.id=$1 AND s.user_id=$2", [req.params.id, req.userId]);
+    if (!sessionQ.rows[0]) return res.status(404).json({ error: "Session not found" });
+    const msgs = await pool.query(
+      "SELECT m.*, u.username FROM bp_support_messages m LEFT JOIN bp_users u ON u.id=m.user_id WHERE m.session_id=$1 ORDER BY m.created_at ASC",
+      [req.params.id]
+    );
+    // Mark as read
+    if (isAdm) {
+      await pool.query("UPDATE bp_support_sessions SET unread_admin=0 WHERE id=$1", [req.params.id]);
+    } else {
+      await pool.query("UPDATE bp_support_sessions SET unread_user=0 WHERE id=$1", [req.params.id]);
+    }
+    res.json({ session: sessionQ.rows[0], messages: msgs.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Send a message ────────────────────────────────────────────────────────
+app.post("/api/brucepanel/support/sessions/:id/messages", auth, async (req, res) => {
+  const { message } = req.body;
+  if (!message?.trim()) return res.status(400).json({ error: "Message required" });
+  const isAdm = req.userRole === "admin" || req.userRole === "moderator";
+  try {
+    // Verify access
+    const sQ = isAdm
+      ? await pool.query("SELECT * FROM bp_support_sessions WHERE id=$1", [req.params.id])
+      : await pool.query("SELECT * FROM bp_support_sessions WHERE id=$1 AND user_id=$2", [req.params.id, req.userId]);
+    const session = sQ.rows[0];
+    if (!session) return res.status(404).json({ error: "Session not found" });
+    if (session.status === "closed") return res.status(403).json({ error: "Session is closed. Open a new one." });
+
+    const msgId = uuidv4();
+    await pool.query(
+      "INSERT INTO bp_support_messages (id,session_id,user_id,is_admin,message) VALUES ($1,$2,$3,$4,$5)",
+      [msgId, req.params.id, isAdm ? req.userId : req.userId, isAdm, message.trim().slice(0, 2000)]
+    );
+
+    const preview = message.trim().slice(0, 120);
+    if (isAdm) {
+      // Admin replied → increment user's unread, notify user
+      await pool.query(
+        "UPDATE bp_support_sessions SET unread_user=unread_user+1, last_message=$1, updated_at=NOW() WHERE id=$2",
+        [preview, req.params.id]
+      );
+      // In-app notification to user
+      await pool.query(
+        "INSERT INTO bp_notifications (id,user_id,title,message,type) VALUES ($1,$2,$3,$4,'info')",
+        [uuidv4(), session.user_id, "📬 Support Reply", `New reply in your support session: "${session.subject}"`]
+      );
+      // Telegram alert to user if enabled
+      const uQ = await pool.query("SELECT telegram_chat_id, telegram_enabled FROM bp_users WHERE id=$1", [session.user_id]);
+      if (uQ.rows[0]?.telegram_enabled && uQ.rows[0]?.telegram_chat_id) {
+        sendTelegram(uQ.rows[0].telegram_chat_id,
+          `📬 *Support Reply*\n\n*Session:* ${session.subject}\n*Message:* ${preview}`
+        ).catch(() => {});
+      }
+    } else {
+      // User replied → increment admin unread
+      await pool.query(
+        "UPDATE bp_support_sessions SET unread_admin=unread_admin+1, last_message=$1, updated_at=NOW() WHERE id=$2",
+        [preview, req.params.id]
+      );
+    }
+    res.json({ messageId: msgId, message: "Sent" });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Close a session ───────────────────────────────────────────────────────
+app.put("/api/brucepanel/support/sessions/:id/close", auth, async (req, res) => {
+  const isAdm = req.userRole === "admin" || req.userRole === "moderator";
+  try {
+    const sQ = isAdm
+      ? await pool.query("SELECT * FROM bp_support_sessions WHERE id=$1", [req.params.id])
+      : await pool.query("SELECT * FROM bp_support_sessions WHERE id=$1 AND user_id=$2", [req.params.id, req.userId]);
+    if (!sQ.rows[0]) return res.status(404).json({ error: "Not found" });
+    await pool.query("UPDATE bp_support_sessions SET status='closed', updated_at=NOW() WHERE id=$1", [req.params.id]);
+    // Send closing message
+    await pool.query(
+      "INSERT INTO bp_support_messages (id,session_id,is_admin,message) VALUES ($1,$2,true,$3)",
+      [uuidv4(), req.params.id, isAdm ? "✅ This session has been closed by support. If you need further help, open a new session." : "🔒 Session closed by user."]
+    );
+    auditLog(req.userId, req.ip, "support_close", `session:${req.params.id}`, req.ip);
+    res.json({ message: "Session closed" });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Reopen a session ──────────────────────────────────────────────────────
+app.put("/api/brucepanel/support/sessions/:id/reopen", auth, async (req, res) => {
+  const isAdm = req.userRole === "admin" || req.userRole === "moderator";
+  try {
+    const where = isAdm ? "id=$1" : "id=$1 AND user_id=$2";
+    const params = isAdm ? [req.params.id] : [req.params.id, req.userId];
+    const sQ = await pool.query(`SELECT * FROM bp_support_sessions WHERE ${where}`, params);
+    if (!sQ.rows[0]) return res.status(404).json({ error: "Not found" });
+    await pool.query("UPDATE bp_support_sessions SET status='open', updated_at=NOW() WHERE id=$1", [req.params.id]);
+    res.json({ message: "Session reopened" });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Admin: all sessions ───────────────────────────────────────────────────
+app.get("/api/brucepanel/admin/support/sessions", auth, adminOnly, async (req, res) => {
+  const { status = "" } = req.query;
+  try {
+    const where = status ? `WHERE s.status=$1` : `WHERE 1=1`;
+    const params = status ? [status] : [];
+    const r = await pool.query(
+      `SELECT s.*, u.username, u.email,
+              (SELECT COUNT(*) FROM bp_support_messages WHERE session_id=s.id) AS message_count
+       FROM bp_support_sessions s
+       JOIN bp_users u ON u.id=s.user_id
+       ${where}
+       ORDER BY s.unread_admin DESC, s.updated_at DESC`,
+      params
+    );
+    res.json({ sessions: r.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Admin: support stats ──────────────────────────────────────────────────
+app.get("/api/brucepanel/admin/support/stats", auth, adminOnly, async (_req, res) => {
+  try {
+    const [open, closed, unread, total] = await Promise.all([
+      pool.query("SELECT COUNT(*) FROM bp_support_sessions WHERE status='open'"),
+      pool.query("SELECT COUNT(*) FROM bp_support_sessions WHERE status='closed'"),
+      pool.query("SELECT COUNT(*) FROM bp_support_sessions WHERE unread_admin > 0 AND status='open'"),
+      pool.query("SELECT COUNT(*) FROM bp_support_messages"),
+    ]);
+    res.json({
+      open:    parseInt(open.rows[0].count),
+      closed:  parseInt(closed.rows[0].count),
+      unread:  parseInt(unread.rows[0].count),
+      messages:parseInt(total.rows[0].count),
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ─── Static client ────────────────────────────────────────────────────────
 const clientDist = path.join(__dirname, "client", "dist");
 if (fs.existsSync(clientDist)) {
