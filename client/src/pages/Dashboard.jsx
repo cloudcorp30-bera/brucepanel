@@ -146,6 +146,7 @@ export default function Dashboard() {
           {/* Nav links */}
           <Link to="/account"  className="hidden sm:block text-slate-400 hover:text-white text-sm transition px-1">Account</Link>
           <Link to="/referral" className="hidden sm:block text-slate-400 hover:text-white text-sm transition px-1">Referral</Link>
+          <Link to="/support"  className="hidden sm:block text-blue-400 hover:text-blue-300 text-sm transition px-1">💬 Support</Link>
           {isAdmin && <Link to="/admin" className="hidden sm:block text-red-400 hover:text-red-300 text-sm font-medium transition px-1">Admin</Link>}
           <button onClick={() => setShowNew(true)} className="bg-blue-600 hover:bg-blue-500 text-white px-3 py-1.5 rounded-lg text-sm font-medium transition">+ New</button>
           <button onClick={logout} className="text-slate-500 hover:text-white text-sm transition">Logout</button>
@@ -157,6 +158,7 @@ export default function Dashboard() {
         <Link to="/subscribe" className="text-amber-400 text-xs">💳 Subscribe</Link>
         <Link to="/store"     className="text-amber-400 text-xs">🛒 Store</Link>
         <Link to="/referral"  className="text-blue-400  text-xs">👥 Referral</Link>
+        <Link to="/support"   className="text-blue-400  text-xs">💬 Support</Link>
         <Link to="/account"   className="text-slate-400 text-xs">👤 Account</Link>
         {isAdmin && <Link to="/admin" className="text-red-400 text-xs font-medium">👑 Admin</Link>}
       </div>
