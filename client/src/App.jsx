@@ -6,6 +6,7 @@ import ProjectDetail from "./pages/ProjectDetail";
 import Subscribe from "./pages/Subscribe";
 import Referral from "./pages/Referral";
 import Admin from "./pages/Admin";
+import Account from "./pages/Account";
 
 function PrivateRoute({ children }) {
   return localStorage.getItem("bp_token") ? children : <Navigate to="/login" replace />;
@@ -22,6 +23,7 @@ export default function App() {
         <Route path="/subscribe" element={<PrivateRoute><Subscribe /></PrivateRoute>} />
         <Route path="/referral" element={<PrivateRoute><Referral /></PrivateRoute>} />
         <Route path="/admin" element={<PrivateRoute><Admin /></PrivateRoute>} />
+        <Route path="/account" element={<PrivateRoute><Account /></PrivateRoute>} />
         <Route path="*" element={<Navigate to="/" />} />
       </Routes>
     </BrowserRouter>
