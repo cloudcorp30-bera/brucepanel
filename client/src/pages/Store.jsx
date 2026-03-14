@@ -33,23 +33,23 @@ export default function Store() {
 
   return (
     <div className="min-h-screen bg-[#0a0a0f]">
-      <div className="border-b border-[#2d2d3e] bg-[#111118] px-4 sm:px-6 py-4 flex items-center justify-between">
-        <div>
-          <h1 className="text-xl font-bold text-white">🪙 BB Coins Store</h1>
-          <p className="text-xs text-slate-500 mt-0.5">Spend your coins on features & bonuses</p>
+      {msg && (
+        <div className={`fixed top-16 right-4 z-50 px-4 py-3 rounded-xl text-sm shadow-lg border transition ${msgOk ? "bg-green-900/80 border-green-700 text-green-300" : "bg-red-900/80 border-red-700 text-red-300"}`}>
+          {msg}
         </div>
-        <div className="flex items-center gap-4">
-          {msg && <span className={`text-sm ${msgOk ? "text-green-400" : "text-red-400"}`}>{msg}</span>}
-          <div className="bg-amber-900/20 border border-amber-800/40 rounded-xl px-4 py-2 flex items-center gap-2">
-            <span className="text-xl">🪙</span>
-            <span className="text-amber-400 font-bold">{coins.toLocaleString()}</span>
-            <span className="text-slate-500 text-xs">BB Coins</span>
-          </div>
-          <Link to="/" className="text-slate-400 hover:text-white text-sm transition">← Dashboard</Link>
-        </div>
-      </div>
+      )}
 
-      <div className="max-w-4xl mx-auto px-4 sm:px-6 py-10">
+      <div className="max-w-4xl mx-auto px-4 sm:px-6 py-6">
+        <div className="flex items-center justify-between mb-6">
+          <div>
+            <h1 className="text-xl font-bold text-white">🪙 BB Coins Store</h1>
+            <p className="text-xs text-slate-500 mt-0.5">Spend your coins on features & bonuses</p>
+          </div>
+          <div className="bg-amber-900/20 border border-amber-800/40 rounded-xl px-4 py-2 flex items-center gap-2">
+            <span>🪙</span>
+            <span className="text-amber-400 font-bold">{coins.toLocaleString()}</span>
+          </div>
+        </div>
         <div className="text-center mb-10">
           <p className="text-slate-400">Earn coins by subscribing, referring friends, or redeeming promo codes. Spend them below.</p>
           <div className="flex items-center justify-center gap-6 mt-4 text-sm text-slate-500">
