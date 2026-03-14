@@ -47,7 +47,7 @@ function auth(req, res, next) {
 }
 
 async function startProcess(projectId, startCommand, env) {
-  stopProcess(projectId);
+  await stopProcess(projectId);  // await ensures old process is dead before starting new one
   const dir = path.join(PROJECTS_DIR, projectId);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   await pool.query("UPDATE bp_projects SET status=$1, updated_at=NOW() WHERE id=$2", ["running", projectId]);
@@ -58,6 +58,8 @@ async function startProcess(projectId, startCommand, env) {
   proc.stdout?.on("data", d => addLog(projectId, d.toString().trim()));
   proc.stderr?.on("data", d => addLog(projectId, `[ERR] ${d.toString().trim()}`));
   proc.on("exit", code => {
+    // If removed from map, process was intentionally stopped — don't overwrite status
+    if (!processes.has(projectId)) return;
     addLog(projectId, `Process exited with code ${code}`);
     pool.query("UPDATE bp_projects SET status=$1, updated_at=NOW() WHERE id=$2", [code === 0 ? "stopped" : "error", projectId]).catch(() => {});
   });
@@ -65,7 +67,19 @@ async function startProcess(projectId, startCommand, env) {
 
 function stopProcess(projectId) {
   const entry = processes.get(projectId);
-  if (entry?.proc) { try { entry.proc.kill("SIGTERM"); } catch {} processes.delete(projectId); }
+  if (!entry?.proc) return Promise.resolve();
+  processes.delete(projectId);
+  return new Promise((resolve) => {
+    const proc = entry.proc;
+    let resolved = false;
+    const done = () => { if (!resolved) { resolved = true; resolve(); } };
+    proc.once("exit", done);
+    try { proc.kill("SIGTERM"); } catch {}
+    // Force SIGKILL after 3s if process refuses to die
+    const killer = setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 3000);
+    proc.once("exit", () => clearTimeout(killer));
+    setTimeout(done, 3500);
+  });
 }
 
 function runInstall(projectId, dir, env, thenStart, startCommand) {
@@ -183,7 +197,7 @@ app.get("/api/brucepanel/projects/:id", auth, async (req, res) => {
 app.delete("/api/brucepanel/projects/:id", auth, async (req, res) => {
   const r = await pool.query("SELECT * FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId]);
   if (!r.rows[0]) return res.status(404).json({ error: "Not found" });
-  stopProcess(req.params.id);
+  await stopProcess(req.params.id);
   const dir = path.join(PROJECTS_DIR, req.params.id);
   if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
   await pool.query("DELETE FROM bp_projects WHERE id=$1", [req.params.id]);
@@ -211,7 +225,7 @@ app.post("/api/brucepanel/projects/:id/start", auth, async (req, res) => {
 app.post("/api/brucepanel/projects/:id/stop", auth, async (req, res) => {
   const r = await pool.query("SELECT * FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId]);
   if (!r.rows[0]) return res.status(404).json({ error: "Not found" });
-  stopProcess(req.params.id);
+  await stopProcess(req.params.id);
   await pool.query("UPDATE bp_projects SET status='stopped', updated_at=NOW() WHERE id=$1", [req.params.id]);
   res.json({ message: "Stopped" });
 });
@@ -220,16 +234,16 @@ app.post("/api/brucepanel/projects/:id/restart", auth, async (req, res) => {
   const r = await pool.query("SELECT * FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId]);
   if (!r.rows[0]) return res.status(404).json({ error: "Not found" });
   const p = r.rows[0];
-  stopProcess(p.id);
-  setTimeout(() => startProcess(p.id, p.start_command, JSON.parse(p.env||"{}")), 500);
-  res.json({ message: "Restarting" });
+  await stopProcess(p.id);
+  await startProcess(p.id, p.start_command, JSON.parse(p.env||"{}"));
+  res.json({ message: "Restarted" });
 });
 
 app.post("/api/brucepanel/projects/:id/reinstall", auth, async (req, res) => {
   const r = await pool.query("SELECT * FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId]);
   if (!r.rows[0]) return res.status(404).json({ error: "Not found" });
   const p = r.rows[0];
-  stopProcess(p.id);
+  await stopProcess(p.id);
   const dir = path.join(PROJECTS_DIR, p.id);
   const nm = path.join(dir, "node_modules");
   if (fs.existsSync(nm)) fs.rmSync(nm, { recursive: true, force: true });
