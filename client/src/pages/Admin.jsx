@@ -1,8 +1,9 @@
 import { useState, useEffect, useRef } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { api } from "../api";
+import AdminSupport from "./AdminSupport";
 
-const TABS = ["Overview","Analytics","Live Feed","System","Search Users","Users","Projects","Transactions","Promo Codes","Audit Log","Notifications","Emergency","Platform"];
+const TABS = ["Overview","Analytics","Live Feed","System","Search Users","Users","Projects","Transactions","Promo Codes","Audit Log","Notifications","Emergency","Platform","Support"];
 
 function bytes(b) {
   if (b > 1e9) return (b/1e9).toFixed(1)+" GB";
@@ -745,6 +746,9 @@ export default function Admin() {
             </div>
           </form>
         )}
+
+        {/* ── Support ────────────────────────────────────────── */}
+        {tab==="Support" && <AdminSupport />}
 
       </div>
     </div>
