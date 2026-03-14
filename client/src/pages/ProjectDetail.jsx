@@ -36,6 +36,8 @@ export default function ProjectDetail() {
 
   if (!project) return <div className="min-h-screen bg-[#0a0a0f] flex items-center justify-center text-slate-500">Loading...</div>;
 
+  const canStop = project.status === "running" || project.status === "error" || project.status === "installing";
+
   return (
     <div className="min-h-screen bg-[#0a0a0f]">
       <nav className="border-b border-[#2d2d3e] bg-[#111118] px-6 py-4 flex items-center gap-4">
@@ -53,11 +55,14 @@ export default function ProjectDetail() {
         {msg && <div className={`rounded-lg px-4 py-2.5 mb-4 text-sm ${msg.startsWith("✅") ? "bg-green-900/30 border border-green-700 text-green-400" : "bg-red-900/30 border border-red-700 text-red-400"}`}>{msg}</div>}
 
         <div className="flex flex-wrap gap-2 mb-6">
-          {project.status === "running"
-            ? <button onClick={() => action(api.stopProject, "Stopped")} className="bg-[#111118] hover:bg-red-900/30 border border-[#2d2d3e] hover:border-red-700 text-red-400 px-4 py-2 rounded-lg text-sm transition">■ Stop</button>
-            : <button onClick={() => action(api.startProject, "Started")} className="bg-[#111118] hover:bg-green-900/30 border border-[#2d2d3e] hover:border-green-700 text-green-400 px-4 py-2 rounded-lg text-sm transition">▶ Start</button>
+          {project.status !== "running" && project.status !== "installing"
+            ? <button onClick={() => action(api.startProject, "Started")} className="bg-[#111118] hover:bg-green-900/30 border border-[#2d2d3e] hover:border-green-700 text-green-400 px-4 py-2 rounded-lg text-sm transition">▶ Start</button>
+            : null
           }
           <button onClick={() => action(api.restartProject, "Restarted")} className="bg-[#111118] hover:bg-[#1a1a24] border border-[#2d2d3e] text-slate-300 px-4 py-2 rounded-lg text-sm transition">↺ Restart</button>
+          {canStop && (
+            <button onClick={() => action(api.stopProject, "Stopped")} className="bg-[#111118] hover:bg-red-900/30 border border-[#2d2d3e] hover:border-red-700 text-red-400 px-4 py-2 rounded-lg text-sm transition">■ Stop</button>
+          )}
           <button onClick={() => action(api.reinstallProject, "Reinstalling...")} className="bg-[#111118] hover:bg-[#1a1a24] border border-[#2d2d3e] text-yellow-400 px-4 py-2 rounded-lg text-sm transition">⟳ Reinstall</button>
           <button onClick={() => { if (confirm("Delete this project?")) { api.deleteProject(id).then(() => nav("/")); } }} className="ml-auto bg-[#111118] hover:bg-red-900/30 border border-[#2d2d3e] hover:border-red-700 text-red-500 px-4 py-2 rounded-lg text-sm transition">Delete</button>
         </div>
