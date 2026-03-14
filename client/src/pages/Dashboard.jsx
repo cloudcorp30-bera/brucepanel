@@ -11,6 +11,10 @@ export default function Dashboard() {
   const [projects, setProjects]       = useState([]);
   const [loading, setLoading]         = useState(true);
   const [showNew, setShowNew]         = useState(false);
+  const [createMode, setCreateMode]   = useState("github"); // "github" | "zip"
+  const [zipFile, setZipFile]         = useState(null);
+  const [uploading, setUploading]     = useState(false);
+  const [uploadProgress, setProgress] = useState("");
 
   const [search, setSearch]           = useState("");
   const [statusFilter, setStatus]     = useState("all");
@@ -34,13 +38,37 @@ export default function Dashboard() {
   useEffect(() => { load(); }, []);
   function flash(m) { setActionMsg(m); setTimeout(() => setActionMsg(""), 3500); }
 
+  function resetNewModal() {
+    setShowNew(false); setCreateMode("github"); setZipFile(null);
+    setProgress(""); setCreateError("");
+    setNewForm({ name:"", description:"", startCommand:"node index.js", githubUrl:"" });
+  }
+
   async function createProject(e) {
     e.preventDefault(); setCreating(true); setCreateError("");
     try {
-      await api.createProject(newForm);
-      setShowNew(false); setNewForm({ name:"", description:"", startCommand:"node index.js", githubUrl:"" });
+      // If ZIP mode, don't pass githubUrl
+      const payload = createMode === "zip"
+        ? { name: newForm.name, description: newForm.description, startCommand: newForm.startCommand }
+        : newForm;
+      const proj = await api.createProject(payload);
+
+      // Upload ZIP straight after creation if one is selected
+      if (createMode === "zip" && zipFile) {
+        setUploading(true);
+        setProgress("Uploading ZIP...");
+        await api.uploadFile(proj.id || proj.projectId, zipFile);
+        setProgress("Installing dependencies...");
+        await new Promise(r => setTimeout(r, 1500)); // brief pause for UX
+        setProgress("");
+        setUploading(false);
+      }
+
+      resetNewModal();
       await load();
+      flash("✅ Project created" + (createMode === "zip" && zipFile ? " and ZIP deployed!" : "!"));
     } catch (err) {
+      setUploading(false); setProgress("");
       setCreateError(err.code === "INSUFFICIENT_COINS" ? "Not enough BB Coins — you need 50 coins. Buy more in the Store!" : err.message);
     }
     setCreating(false);
@@ -110,54 +138,122 @@ export default function Dashboard() {
           <>
             {/* New project form */}
             {showNew && (
-              <div className="bg-[#111118] border border-[#2d2d3e] rounded-xl p-6 mb-6">
-                <div className="flex items-center justify-between mb-4">
-                  <h3 className="text-white font-semibold">New Project</h3>
-                  <button onClick={() => { setShowNew(false); setCreateError(""); }} className="text-slate-500 hover:text-white text-lg">✕</button>
+              <div className="bg-[#111118] border border-[#2d2d3e] rounded-xl mb-6 overflow-hidden">
+                {/* Modal header */}
+                <div className="flex items-center justify-between px-6 pt-5 pb-4">
+                  <h3 className="text-white font-semibold text-base">New Project</h3>
+                  <button onClick={resetNewModal} className="w-8 h-8 flex items-center justify-center rounded-lg hover:bg-[#2d2d3e] text-slate-500 hover:text-white transition text-lg">✕</button>
                 </div>
-                {createError && (
-                  <div className="bg-red-900/30 border border-red-700 text-red-400 rounded-lg px-4 py-3 mb-4 text-sm">
-                    {createError}
-                    {createError.includes("coins") && (
-                      <Link to="/store" className="block mt-1.5 text-amber-400 underline text-xs">🛒 Visit Store →</Link>
+
+                {/* Deployment method tabs */}
+                <div className="flex border-b border-[#2d2d3e] px-6">
+                  <button type="button" onClick={() => setCreateMode("github")}
+                    className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 -mb-px transition
+                      ${createMode === "github" ? "border-blue-500 text-blue-400" : "border-transparent text-slate-500 hover:text-white"}`}>
+                    <span>🐙</span> GitHub Repo
+                  </button>
+                  <button type="button" onClick={() => setCreateMode("zip")}
+                    className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 -mb-px transition
+                      ${createMode === "zip" ? "border-green-500 text-green-400" : "border-transparent text-slate-500 hover:text-white"}`}>
+                    <span>📦</span> ZIP Upload
+                  </button>
+                </div>
+
+                <div className="px-6 py-5">
+                  {createError && (
+                    <div className="bg-red-900/30 border border-red-700 text-red-400 rounded-lg px-4 py-3 mb-4 text-sm">
+                      {createError}
+                      {createError.includes("coins") && (
+                        <Link to="/store" className="block mt-1.5 text-amber-400 underline text-xs">🛒 Visit Store →</Link>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Upload progress */}
+                  {uploading && (
+                    <div className="bg-blue-900/20 border border-blue-800/50 text-blue-400 rounded-lg px-4 py-3 mb-4 text-sm flex items-center gap-3">
+                      <span className="animate-spin text-base">↻</span>
+                      <span>{uploadProgress || "Processing..."}</span>
+                    </div>
+                  )}
+
+                  <form onSubmit={createProject} className="space-y-4">
+                    {/* Common fields */}
+                    <div className="grid sm:grid-cols-2 gap-4">
+                      <div className="sm:col-span-2">
+                        <label className="text-slate-400 text-sm block mb-1">Project Name *</label>
+                        <input value={newForm.name} onChange={e => setNewForm(f => ({ ...f, name: e.target.value }))}
+                          className="w-full bg-[#1a1a24] border border-[#2d2d3e] rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-blue-500"
+                          placeholder="My Telegram Bot" required />
+                      </div>
+                      <div>
+                        <label className="text-slate-400 text-sm block mb-1">Start Command</label>
+                        <input value={newForm.startCommand} onChange={e => setNewForm(f => ({ ...f, startCommand: e.target.value }))}
+                          className="w-full bg-[#1a1a24] border border-[#2d2d3e] rounded-lg px-4 py-2.5 text-white font-mono focus:outline-none focus:border-blue-500"
+                          placeholder="node index.js" />
+                      </div>
+                      <div>
+                        <label className="text-slate-400 text-sm block mb-1">Description <span className="text-slate-600">(optional)</span></label>
+                        <input value={newForm.description} onChange={e => setNewForm(f => ({ ...f, description: e.target.value }))}
+                          className="w-full bg-[#1a1a24] border border-[#2d2d3e] rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-blue-500"
+                          placeholder="What does this do?" />
+                      </div>
+                    </div>
+
+                    {/* GitHub-only field */}
+                    {createMode === "github" && (
+                      <div>
+                        <label className="text-slate-400 text-sm block mb-1">GitHub URL <span className="text-slate-600">(optional)</span></label>
+                        <input value={newForm.githubUrl} onChange={e => setNewForm(f => ({ ...f, githubUrl: e.target.value }))}
+                          className="w-full bg-[#1a1a24] border border-[#2d2d3e] rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-blue-500"
+                          placeholder="https://github.com/user/repo" />
+                        <p className="text-slate-600 text-xs mt-1.5">Leave blank to start with an empty project and upload files later.</p>
+                      </div>
                     )}
-                  </div>
-                )}
-                <form onSubmit={createProject} className="grid sm:grid-cols-2 gap-4">
-                  <div className="sm:col-span-2">
-                    <label className="text-slate-400 text-sm block mb-1">Project Name *</label>
-                    <input value={newForm.name} onChange={e => setNewForm(f => ({ ...f, name: e.target.value }))}
-                      className="w-full bg-[#1a1a24] border border-[#2d2d3e] rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-blue-500"
-                      placeholder="My Telegram Bot" required />
-                  </div>
-                  <div>
-                    <label className="text-slate-400 text-sm block mb-1">Start Command</label>
-                    <input value={newForm.startCommand} onChange={e => setNewForm(f => ({ ...f, startCommand: e.target.value }))}
-                      className="w-full bg-[#1a1a24] border border-[#2d2d3e] rounded-lg px-4 py-2.5 text-white font-mono focus:outline-none focus:border-blue-500"
-                      placeholder="node index.js" />
-                  </div>
-                  <div>
-                    <label className="text-slate-400 text-sm block mb-1">GitHub URL <span className="text-slate-600">(optional)</span></label>
-                    <input value={newForm.githubUrl} onChange={e => setNewForm(f => ({ ...f, githubUrl: e.target.value }))}
-                      className="w-full bg-[#1a1a24] border border-[#2d2d3e] rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-blue-500"
-                      placeholder="https://github.com/user/repo" />
-                  </div>
-                  <div className="sm:col-span-2">
-                    <label className="text-slate-400 text-sm block mb-1">Description <span className="text-slate-600">(optional)</span></label>
-                    <input value={newForm.description} onChange={e => setNewForm(f => ({ ...f, description: e.target.value }))}
-                      className="w-full bg-[#1a1a24] border border-[#2d2d3e] rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-blue-500"
-                      placeholder="What does this project do?" />
-                  </div>
-                  <div className="sm:col-span-2 flex gap-3 items-center">
-                    <button type="submit" disabled={creating}
-                      className="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white px-6 py-2.5 rounded-lg text-sm font-medium transition">
-                      {creating ? "Creating..." : "Create Project"}
-                    </button>
-                    <button type="button" onClick={() => { setShowNew(false); setCreateError(""); }}
-                      className="text-slate-400 hover:text-white px-4 py-2.5 text-sm transition">Cancel</button>
-                    <span className="text-slate-600 text-xs ml-auto">First 2 projects free · 50 coins/extra</span>
-                  </div>
-                </form>
+
+                    {/* ZIP Upload field */}
+                    {createMode === "zip" && (
+                      <div>
+                        <label className="text-slate-400 text-sm block mb-1">ZIP File <span className="text-slate-600">(optional — can upload after creation too)</span></label>
+                        <div
+                          onClick={() => document.getElementById("zipInput").click()}
+                          className={`w-full border-2 border-dashed rounded-xl px-4 py-8 text-center cursor-pointer transition
+                            ${zipFile ? "border-green-600/60 bg-green-900/10" : "border-[#2d2d3e] hover:border-[#3d3d4e] hover:bg-[#1a1a24]"}`}>
+                          {zipFile ? (
+                            <div>
+                              <p className="text-green-400 text-2xl mb-1">📦</p>
+                              <p className="text-green-400 font-medium text-sm">{zipFile.name}</p>
+                              <p className="text-slate-500 text-xs mt-1">{(zipFile.size / 1024 / 1024).toFixed(2)} MB · Click to change</p>
+                            </div>
+                          ) : (
+                            <div>
+                              <p className="text-3xl mb-2">📦</p>
+                              <p className="text-slate-300 text-sm font-medium">Click to pick a ZIP file</p>
+                              <p className="text-slate-600 text-xs mt-1">Max 100 MB · Your bot/app code in a .zip archive</p>
+                            </div>
+                          )}
+                          <input id="zipInput" type="file" accept=".zip" className="hidden"
+                            onChange={e => setZipFile(e.target.files?.[0] || null)} />
+                        </div>
+                        {zipFile && (
+                          <button type="button" onClick={() => setZipFile(null)}
+                            className="text-slate-500 hover:text-red-400 text-xs mt-1.5 transition">✕ Remove file</button>
+                        )}
+                      </div>
+                    )}
+
+                    <div className="flex flex-wrap gap-3 items-center pt-1">
+                      <button type="submit" disabled={creating || uploading}
+                        className={`px-6 py-2.5 rounded-lg text-sm font-medium text-white transition disabled:opacity-50
+                          ${createMode === "zip" ? "bg-green-700 hover:bg-green-600" : "bg-blue-600 hover:bg-blue-500"}`}>
+                        {uploading ? uploadProgress || "Uploading..." : creating ? "Creating..." : createMode === "zip" ? "📦 Create & Deploy" : "🐙 Create Project"}
+                      </button>
+                      <button type="button" onClick={resetNewModal}
+                        className="text-slate-400 hover:text-white px-4 py-2.5 text-sm transition">Cancel</button>
+                      <span className="text-slate-600 text-xs ml-auto">First 2 projects free · 50 coins/extra</span>
+                    </div>
+                  </form>
+                </div>
               </div>
             )}
 
