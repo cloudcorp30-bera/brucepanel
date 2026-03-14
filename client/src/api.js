@@ -133,4 +133,16 @@ export const api = {
     req("POST", "/admin/emergency/broadcast", { title, message, type }),
   adminNotes: () => req("GET", "/admin/notes"),
   adminSaveNotes: (notes) => req("PUT", "/admin/notes", { notes }),
+
+  // Support chat
+  supportSessions: () => req("GET", "/support/sessions"),
+  supportCreate: (subject) => req("POST", "/support/sessions", { subject }),
+  supportSession: (id) => req("GET", `/support/sessions/${id}`),
+  supportSend: (id, message) => req("POST", `/support/sessions/${id}/messages`, { message }),
+  supportClose: (id) => req("PUT", `/support/sessions/${id}/close`),
+  supportReopen: (id) => req("PUT", `/support/sessions/${id}/reopen`),
+
+  // Admin support
+  adminSupportSessions: (status = "") => req("GET", `/admin/support/sessions${status ? `?status=${status}` : ""}`),
+  adminSupportStats: () => req("GET", "/admin/support/stats"),
 };
