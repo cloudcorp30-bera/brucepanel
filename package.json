@@ -1,0 +1,21 @@
+{
+  "name": "brucepanel",
+  "version": "1.0.0",
+  "description": "BrucePanel — Node.js project hosting panel by Bruce Bera / Bera Tech Org",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "build": "cd client && npm install && npm run build",
+    "build:start": "npm run build && npm start"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.11.3",
+    "uuid": "^9.0.0"
+  }
+}
