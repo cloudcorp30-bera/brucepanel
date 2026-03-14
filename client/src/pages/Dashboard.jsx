@@ -1,5 +1,5 @@
-import { useState, useEffect, useRef } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { useState, useEffect } from "react";
+import { Link } from "react-router-dom";
 import { api } from "../api";
 
 const STATUS_DOT  = { running:"bg-green-400", stopped:"bg-slate-500", error:"bg-red-400", installing:"bg-yellow-400", idle:"bg-slate-600" };
@@ -11,8 +11,7 @@ export default function Dashboard() {
   const [projects, setProjects]       = useState([]);
   const [loading, setLoading]         = useState(true);
   const [showNew, setShowNew]         = useState(false);
-  const [notifications, setNotif]     = useState([]);
-  const [showNotif, setShowNotif]     = useState(false);
+
   const [search, setSearch]           = useState("");
   const [statusFilter, setStatus]     = useState("all");
   const [sortBy, setSortBy]           = useState("name");
@@ -21,29 +20,18 @@ export default function Dashboard() {
   const [createError, setCreateError] = useState("");
   const [cloning, setCloning]         = useState(null);
   const [actionMsg, setActionMsg]     = useState("");
-  const notifRef = useRef(null);
-  const nav = useNavigate();
 
   async function load() {
     try {
-      const [me, proj, notif] = await Promise.all([api.me(), api.projects(), api.notifications()]);
+      const [me, proj] = await Promise.all([api.me(), api.projects()]);
       setUser(me);
       localStorage.setItem("bp_user", JSON.stringify(me));
       setProjects(proj.projects || []);
-      setNotif(notif.notifications || []);
     } catch {}
     setLoading(false);
   }
 
   useEffect(() => { load(); }, []);
-  useEffect(() => {
-    function handleClick(e) { if (notifRef.current && !notifRef.current.contains(e.target)) setShowNotif(false); }
-    document.addEventListener("mousedown", handleClick);
-    return () => document.removeEventListener("mousedown", handleClick);
-  }, []);
-
-  function logout() { localStorage.removeItem("bp_token"); localStorage.removeItem("bp_user"); nav("/login"); }
-
   function flash(m) { setActionMsg(m); setTimeout(() => setActionMsg(""), 3500); }
 
   async function createProject(e) {
@@ -73,11 +61,6 @@ export default function Dashboard() {
     setCloning(null);
   }
 
-  async function markRead(id) {
-    await api.markRead(id).catch(() => {});
-    setNotif(ns => ns.map(n => n.id === id ? { ...n, read: true } : n));
-  }
-
   // Filter + search + sort
   const visible = projects
     .filter(p => statusFilter === "all" || p.status === statusFilter)
@@ -89,79 +72,11 @@ export default function Dashboard() {
       return 0;
     });
 
-  const unread  = notifications.filter(n => !n.read).length;
-  const isAdmin = user?.role === "admin" || user?.role === "moderator";
   const runningCount = projects.filter(p => p.status === "running").length;
 
   return (
     <div className="min-h-screen bg-[#0a0a0f]">
 
-      {/* Navbar */}
-      <nav className="border-b border-[#2d2d3e] bg-[#111118] px-4 sm:px-6 py-3 flex items-center justify-between sticky top-0 z-20">
-        <div>
-          <h1 className="text-lg font-bold text-white">🦅 BrucePanel</h1>
-          <p className="text-xs text-slate-600 hidden sm:block">by Bera Tech Org</p>
-        </div>
-        <div className="flex items-center gap-2 sm:gap-3">
-          {/* BB Coins / Store */}
-          {user && (
-            <Link to="/store" className="flex items-center gap-1.5 bg-amber-500/10 border border-amber-500/20 text-amber-400 px-3 py-1.5 rounded-lg text-sm font-medium hover:bg-amber-500/20 transition">
-              <span>🪙</span>
-              <span className="font-bold">{user.coins?.toLocaleString() || 0}</span>
-            </Link>
-          )}
-          {/* Notification bell */}
-          <div className="relative" ref={notifRef}>
-            <button onClick={() => setShowNotif(v => !v)}
-              className="relative p-2 rounded-lg hover:bg-[#1a1a24] transition text-slate-400 hover:text-white">
-              🔔
-              {unread > 0 && (
-                <span className="absolute -top-0.5 -right-0.5 bg-red-500 text-white text-[10px] font-bold rounded-full min-w-[16px] h-4 flex items-center justify-center px-1">
-                  {unread > 9 ? "9+" : unread}
-                </span>
-              )}
-            </button>
-            {showNotif && (
-              <div className="absolute right-0 top-full mt-2 w-80 bg-[#111118] border border-[#2d2d3e] rounded-xl shadow-2xl z-50 max-h-96 overflow-y-auto">
-                <div className="px-4 py-3 border-b border-[#2d2d3e] flex items-center justify-between">
-                  <span className="text-sm font-semibold text-white">Notifications</span>
-                  {unread > 0 && <span className="text-xs text-slate-500">{unread} unread</span>}
-                </div>
-                {notifications.length === 0
-                  ? <div className="px-4 py-6 text-center text-slate-500 text-sm">No notifications</div>
-                  : notifications.slice(0, 15).map(n => (
-                    <div key={n.id} onClick={() => markRead(n.id)}
-                      className={`px-4 py-3 border-b border-[#2d2d3e]/50 cursor-pointer hover:bg-[#1a1a24] transition ${!n.read ? "border-l-2 border-l-blue-500" : ""}`}>
-                      <div className="flex items-start justify-between gap-2">
-                        <span className={`text-xs font-semibold ${!n.read ? "text-white" : "text-slate-300"}`}>{n.title}</span>
-                        <span className="text-[10px] text-slate-600 whitespace-nowrap shrink-0">{new Date(n.created_at).toLocaleDateString()}</span>
-                      </div>
-                      <p className="text-xs text-slate-400 mt-0.5 line-clamp-2">{n.message}</p>
-                    </div>
-                  ))
-                }
-              </div>
-            )}
-          </div>
-          {/* Nav links */}
-          <Link to="/account"  className="hidden sm:block text-slate-400 hover:text-white text-sm transition px-1">Account</Link>
-          <Link to="/referral" className="hidden sm:block text-slate-400 hover:text-white text-sm transition px-1">Referral</Link>
-          <Link to="/support"  className="hidden sm:block text-blue-400 hover:text-blue-300 text-sm transition px-1">💬 Support</Link>
-          {isAdmin && <Link to="/admin" className="hidden sm:block text-red-400 hover:text-red-300 text-sm font-medium transition px-1">Admin</Link>}
-          <button onClick={() => setShowNew(true)} className="bg-blue-600 hover:bg-blue-500 text-white px-3 py-1.5 rounded-lg text-sm font-medium transition">+ New</button>
-          <button onClick={logout} className="text-slate-500 hover:text-white text-sm transition">Logout</button>
-        </div>
-      </nav>
-
-      {/* Mobile quick links */}
-      <div className="sm:hidden bg-[#111118] border-b border-[#2d2d3e] px-4 py-2 flex gap-4">
-        <Link to="/subscribe" className="text-amber-400 text-xs">💳 Subscribe</Link>
-        <Link to="/store"     className="text-amber-400 text-xs">🛒 Store</Link>
-        <Link to="/referral"  className="text-blue-400  text-xs">👥 Referral</Link>
-        <Link to="/support"   className="text-blue-400  text-xs">💬 Support</Link>
-        <Link to="/account"   className="text-slate-400 text-xs">👤 Account</Link>
-        {isAdmin && <Link to="/admin" className="text-red-400 text-xs font-medium">👑 Admin</Link>}
-      </div>
 
       <div className="max-w-6xl mx-auto px-4 sm:px-6 py-8">
 
