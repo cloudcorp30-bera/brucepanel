@@ -14,13 +14,23 @@ export default function Account() {
   const [passwords, setPasswords] = useState({ current:"", next:"", confirm:"" });
   const [promoCode, setPromoCode] = useState("");
   const [saving, setSaving] = useState(false);
+  const [telegram, setTelegram] = useState({ chatId:"", enabled:false, botName:"" });
+  const [telegramSaving, setTelegramSaving] = useState(false);
 
   function flash(text, ok=true) { setMsg({ text, ok }); setTimeout(() => setMsg({ text:"", ok:true }), 4000); }
 
   useEffect(() => {
     api.me().then(u => { setUser(u); setProfile({ email: u.email || "", bio: u.bio || "" }); }).catch(()=>{});
     api.userActivity().then(r => setActivity(r.activity || [])).catch(()=>{});
+    api.getTelegram().then(r => setTelegram({ chatId: r.chatId||"", enabled: r.enabled||false, botName: r.botName||"" })).catch(()=>{});
   }, []);
+
+  async function saveTelegram(e) {
+    e.preventDefault(); setTelegramSaving(true);
+    try { await api.saveTelegram(telegram.chatId, telegram.enabled); flash(telegram.chatId ? "Telegram connected! Check for a test message." : "Telegram disconnected."); }
+    catch (err) { flash(err.message, false); }
+    setTelegramSaving(false);
+  }
 
   async function saveProfile(e) {
     e.preventDefault(); setSaving(true);
@@ -73,8 +83,8 @@ export default function Account() {
         )}
 
         {/* Tabs */}
-        <div className="flex border-b border-[#2d2d3e] mb-6 gap-1">
-          {[["profile","👤 Profile"],["security","🔐 Security"],["promo","🎁 Promo Code"],["activity","📋 Activity"]].map(([t,l]) => (
+        <div className="flex border-b border-[#2d2d3e] mb-6 gap-1 overflow-x-auto">
+          {[["profile","👤 Profile"],["security","🔐 Security"],["promo","🎁 Promo Code"],["telegram","📲 Telegram"],["activity","📋 Activity"]].map(([t,l]) => (
             <button key={t} onClick={() => setTab(t)}
               className={`px-4 py-2.5 text-sm font-medium border-b-2 transition whitespace-nowrap ${tab === t ? "border-blue-500 text-blue-400" : "border-transparent text-slate-400 hover:text-white"}`}>
               {l}
@@ -155,6 +165,53 @@ export default function Account() {
                 <li>• Refer friends — earn <strong className="text-amber-400">25 BB Coins</strong> per signup</li>
               </ul>
             </div>
+          </div>
+        )}
+
+        {/* Telegram */}
+        {tab === "telegram" && (
+          <div className="space-y-4">
+            <form onSubmit={saveTelegram} className="bg-[#111118] border border-[#2d2d3e] rounded-xl p-6 space-y-4">
+              <h3 className="text-white font-semibold">📲 Telegram Crash Alerts</h3>
+              <p className="text-slate-500 text-sm">Get an instant Telegram message when your project crashes. You can set up notifications in seconds.</p>
+              <div className="bg-blue-900/10 border border-blue-800/40 rounded-lg p-4 space-y-2">
+                <p className="text-blue-300 text-sm font-medium">How to connect:</p>
+                <ol className="text-slate-400 text-sm space-y-1 list-decimal list-inside">
+                  {telegram.botName
+                    ? <li>Start a chat with <a href={`https://t.me/${telegram.botName}`} target="_blank" rel="noreferrer" className="text-blue-400 underline">@{telegram.botName}</a> on Telegram</li>
+                    : <li>Start a chat with the BrucePanel bot on Telegram</li>}
+                  <li>Send <span className="font-mono text-white bg-[#2d2d3e] px-1.5 py-0.5 rounded">/start</span> to the bot</li>
+                  <li>Go to <a href="https://t.me/userinfobot" target="_blank" rel="noreferrer" className="text-blue-400 underline">@userinfobot</a> and send it <span className="font-mono text-white bg-[#2d2d3e] px-1.5 py-0.5 rounded">/start</span> to get your Chat ID</li>
+                  <li>Paste your Chat ID below and save</li>
+                </ol>
+              </div>
+              <div>
+                <label className="text-slate-400 text-sm block mb-1">Your Telegram Chat ID</label>
+                <input value={telegram.chatId} onChange={e => setTelegram(t => ({ ...t, chatId: e.target.value }))}
+                  className="w-full bg-[#1a1a24] border border-[#2d2d3e] rounded-lg px-4 py-2.5 text-white font-mono focus:outline-none focus:border-blue-500"
+                  placeholder="e.g. 123456789" />
+              </div>
+              <div className="flex items-center justify-between p-4 bg-[#1a1a24] border border-[#2d2d3e] rounded-lg">
+                <div>
+                  <div className="text-white text-sm font-medium">Enable Notifications</div>
+                  <div className="text-slate-500 text-xs mt-0.5">Receive a message when any of your projects crash</div>
+                </div>
+                <button type="button" onClick={() => setTelegram(t => ({ ...t, enabled: !t.enabled }))}
+                  className={`relative w-12 h-6 rounded-full transition-colors ${telegram.enabled ? "bg-green-600" : "bg-[#2d2d3e]"}`}>
+                  <span className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white transition-transform ${telegram.enabled ? "translate-x-6" : ""}`} />
+                </button>
+              </div>
+              <button type="submit" disabled={telegramSaving}
+                className="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white px-6 py-2.5 rounded-lg text-sm font-medium transition">
+                {telegramSaving ? "Saving..." : "Save & Test Connection"}
+              </button>
+            </form>
+            {telegram.chatId && telegram.enabled && (
+              <div className="bg-green-900/10 border border-green-800/40 rounded-xl p-4">
+                <p className="text-green-400 text-sm font-medium">✅ Telegram alerts are active</p>
+                <p className="text-slate-500 text-xs mt-1">Chat ID: <span className="text-slate-300 font-mono">{telegram.chatId}</span></p>
+              </div>
+            )}
           </div>
         )}
 
