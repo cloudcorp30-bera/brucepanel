@@ -9,6 +9,8 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import pg from "pg";
+import multer from "multer";
+import AdmZip from "adm-zip";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const { Pool } = pg;
@@ -37,6 +39,32 @@ const PLANS = [
 ];
 
 if (!fs.existsSync(PROJECTS_DIR)) fs.mkdirSync(PROJECTS_DIR, { recursive: true });
+
+const UPLOADS_DIR = path.join(__dirname, "bp_uploads");
+if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+const upload = multer({ dest: UPLOADS_DIR, limits: { fileSize: 100 * 1024 * 1024 } });
+
+function listProjectFiles(dir, base = "", depth = 0) {
+  if (depth > 6) return [];
+  const IGNORE = new Set(["node_modules", ".git", "brucepanel.log", "bp_uploads", ".npm", ".cache"]);
+  const entries = [];
+  try {
+    const items = fs.readdirSync(dir, { withFileTypes: true });
+    for (const item of items) {
+      if (IGNORE.has(item.name)) continue;
+      const relPath = base ? `${base}/${item.name}` : item.name;
+      const fullPath = path.join(dir, item.name);
+      if (item.isDirectory()) {
+        entries.push({ name: item.name, path: relPath, type: "dir", children: listProjectFiles(fullPath, relPath, depth + 1) });
+      } else {
+        const stat = fs.statSync(fullPath);
+        entries.push({ name: item.name, path: relPath, type: "file", size: stat.size });
+      }
+    }
+  } catch {}
+  return entries.sort((a, b) => (a.type === "dir" ? -1 : 1) - (b.type === "dir" ? -1 : 1) || a.name.localeCompare(b.name));
+}
+
 
 const processes  = new Map(); // projectId → { proc, logs }
 const sseClients = new Map(); // projectId → Set<res>
@@ -500,6 +528,105 @@ app.put("/api/brucepanel/projects/:id/env", auth, async (req, res) => {
   if (!r.rows[0]) return res.status(404).json({ error: "Not found" });
   await pool.query("UPDATE bp_projects SET env=$1, updated_at=NOW() WHERE id=$2", [JSON.stringify(req.body.env || {}), req.params.id]);
   res.json({ message: "Updated" });
+});
+
+
+// ─── File manager routes ──────────────────────────────────────────────────
+
+// Upload ZIP or single file
+app.post("/api/brucepanel/projects/:id/upload", auth, upload.single("file"), async (req, res) => {
+  const cleanup = () => { try { if (req.file?.path && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path); } catch {} };
+  try {
+    const r = await pool.query("SELECT id FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId]);
+    if (!r.rows[0]) { cleanup(); return res.status(404).json({ error: "Not found" }); }
+    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+
+    const projectDir = path.join(PROJECTS_DIR, req.params.id);
+    if (!fs.existsSync(projectDir)) fs.mkdirSync(projectDir, { recursive: true });
+
+    const origName = req.file.originalname || "upload";
+    if (origName.toLowerCase().endsWith(".zip")) {
+      const zip = new AdmZip(req.file.path);
+      const entries = zip.getEntries();
+      // If all entries share one top-level dir, extract contents directly
+      const tops = new Set(entries.map(e => e.entryName.split("/")[0]).filter(Boolean));
+      if (tops.size === 1) {
+        const topDir = [...tops][0];
+        for (const entry of entries) {
+          if (entry.isDirectory) continue;
+          const rel = entry.entryName.slice(topDir.length + 1);
+          if (!rel) continue;
+          const dest = path.join(projectDir, rel);
+          fs.mkdirSync(path.dirname(dest), { recursive: true });
+          fs.writeFileSync(dest, entry.getData());
+        }
+      } else {
+        zip.extractAllTo(projectDir, true);
+      }
+    } else {
+      const dest = path.join(projectDir, origName);
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.copyFileSync(req.file.path, dest);
+    }
+    cleanup();
+    res.json({ message: "Uploaded successfully" });
+  } catch (e) { cleanup(); res.status(500).json({ error: e.message || "Upload failed" }); }
+});
+
+// List project files
+app.get("/api/brucepanel/projects/:id/files", auth, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT id FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId]);
+    if (!r.rows[0]) return res.status(404).json({ error: "Not found" });
+    const projectDir = path.join(PROJECTS_DIR, req.params.id);
+    res.json({ files: fs.existsSync(projectDir) ? listProjectFiles(projectDir) : [] });
+  } catch (e) { res.status(500).json({ error: "Failed" }); }
+});
+
+// Get file content
+app.get("/api/brucepanel/projects/:id/files/content", auth, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT id FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId]);
+    if (!r.rows[0]) return res.status(404).json({ error: "Not found" });
+    const filePath = req.query.path || "";
+    if (!filePath || filePath.includes("..")) return res.status(400).json({ error: "Invalid path" });
+    const full = path.resolve(path.join(PROJECTS_DIR, req.params.id, filePath));
+    if (!full.startsWith(path.resolve(path.join(PROJECTS_DIR, req.params.id)))) return res.status(403).json({ error: "Access denied" });
+    if (!fs.existsSync(full) || fs.statSync(full).isDirectory()) return res.status(404).json({ error: "Not found" });
+    const stat = fs.statSync(full);
+    if (stat.size > 2 * 1024 * 1024) return res.status(400).json({ error: "File too large to edit (>2MB)" });
+    res.json({ content: fs.readFileSync(full, "utf8") });
+  } catch (e) { res.status(500).json({ error: "Failed to read file" }); }
+});
+
+// Save file content
+app.put("/api/brucepanel/projects/:id/files/content", auth, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT id FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId]);
+    if (!r.rows[0]) return res.status(404).json({ error: "Not found" });
+    const filePath = req.body.path || "";
+    if (!filePath || filePath.includes("..")) return res.status(400).json({ error: "Invalid path" });
+    const full = path.resolve(path.join(PROJECTS_DIR, req.params.id, filePath));
+    if (!full.startsWith(path.resolve(path.join(PROJECTS_DIR, req.params.id)))) return res.status(403).json({ error: "Access denied" });
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, req.body.content ?? "");
+    res.json({ message: "Saved" });
+  } catch (e) { res.status(500).json({ error: "Failed to save" }); }
+});
+
+// Delete file or folder
+app.delete("/api/brucepanel/projects/:id/files", auth, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT id FROM bp_projects WHERE id=$1 AND user_id=$2", [req.params.id, req.userId]);
+    if (!r.rows[0]) return res.status(404).json({ error: "Not found" });
+    const filePath = req.query.path || "";
+    if (!filePath || filePath.includes("..")) return res.status(400).json({ error: "Invalid path" });
+    const full = path.resolve(path.join(PROJECTS_DIR, req.params.id, filePath));
+    if (!full.startsWith(path.resolve(path.join(PROJECTS_DIR, req.params.id)))) return res.status(403).json({ error: "Access denied" });
+    if (!fs.existsSync(full)) return res.status(404).json({ error: "Not found" });
+    fs.statSync(full).isDirectory() ? fs.rmSync(full, { recursive: true, force: true }) : fs.unlinkSync(full);
+    res.json({ message: "Deleted" });
+  } catch (e) { res.status(500).json({ error: "Failed to delete" }); }
 });
 
 // ─── Subscribe routes ─────────────────────────────────────────────────────
